@@ -77,20 +77,31 @@ Before issuing read/write commands, the MK3 adapter needs an address set. VEConf
 
 ### Address Set
 
-Sets the target device address on the VE.Bus. For a single-inverter system, address 1 is standard.
+Selects which VE.Bus device subsequent commands target. General form:
 
 ```
-TX: 04 FF 41 01 00 BB
+TX: 04 FF 41 01 <addr> <checksum>
 ```
 
-Breakdown:
+Breakdown (standalone/master example, `addr = 0x00`):
 - `04` — length (4 bytes follow)
 - `FF` — frame marker
 - `41` — 'A' command (Address Set)
-- `01 00` — address 1, little-endian
+- `01` — subcommand: **set** address (`0x00` reads the current address back)
+- `00` — device **address 0** (the master / a standalone unit)
 - `BB` — checksum
 
-After sending, wait ~100ms before issuing commands. The inverter does not send a distinct ACK for the address set, but the next response frame will use the new address.
+> **Correction (July 2026):** earlier revisions of this document read the two
+> bytes `01 00` as "address 1, little-endian". That is wrong — confirmed
+> against the official Victron *Interfacing with VE.Bus products — MK2
+> Protocol* document and the j9brown/victron-mk3 library (which sends
+> `'A', [1, 0]`: subcommand 1, address 0). Every tool in this repo has
+> therefore always been talking to **address 0**. Addresses run 0–31; the
+> other units of a configured parallel/split-phase system live at other
+> addresses (see §12). `protocol.build_address_frame(addr)` builds the frame;
+> `bus_scan.py` discovers which addresses answer.
+
+After sending, wait ~100ms before issuing commands. The inverter does not send a distinct ACK for the address set, but subsequent Winmon reads return the selected device's values. The selection can be lost on a device/MK3 power cycle — re-send the address frame after any reconnect (victron_mk3 re-sends it on startup for the same reason).
 
 ### Optional: Sync Sequence
 
@@ -277,6 +288,47 @@ States:
 
 The extended form includes additional flags whose meaning is not fully decoded. The simple form is sufficient for power cycling: send state `0x00`, wait 2–3 seconds, send state `0x01` or `0x03`.
 
+### 4.7 DC and AC Info Frames ('F' 0–4 → 0x20 frames)
+
+The 'F' command with args 0–4 requests live snapshot frames (arg 5 is GetConfig, §4.x above). These carry no Winmon slot byte:
+
+```
+TX: 04 FF 46 <arg> <checksum>     — arg: 0=DC, 1=AC L1, 2=AC L2, 3=L3, 4=L4
+```
+
+**The responses do NOT begin with `0xFF`** — they are "info frames" starting with `0x20` (and the GetConfig response starts with `0x41`). The dump-and-scan approach used for Winmon responses cannot align to them; read length-prefixed frames and validate the checksum (`protocol._read_synced`), dropping a byte to resync on mismatch. Byte offsets below are into the payload (after the length byte, checksum stripped), ported from victron_mk3 and validated against a live MultiPlus II. All multi-byte fields are little-endian; scaling comes from GetVariableInfo (§4.5b) for the RAM variable given per field.
+
+**DC frame** (`payload[5] == 0x0C`, length ≥ 15):
+
+| Offset | Field | Width | Scale source |
+|---|---|---|---|
+| 6:8 | Battery voltage | u16 | var 4 info |
+| 8:11 | Current battery → inverter | **u24** | var 5 info |
+| 11:14 | Current charger → battery | **u24** | var 5 info |
+| 14 | Inverter period | u8 | var 7 info, then `f = 10 / period` |
+
+**AC frame** (`0x05 ≤ payload[5] ≤ 0x0B`, length ≥ 15):
+
+| Offset | Field | Width | Scale source |
+|---|---|---|---|
+| 1 | Mains-current multiplier | u8 | applied to offset 8:10 |
+| 2 | Inverter-current multiplier | u8 | applied to offset 12:14 |
+| 4 | Device state | u8 | 0 Down, 1 Startup, 2 Off, **3 Slave**, 4 Invert full, 5 Invert half, 6 Invert AES, 7 Power assist, 8 Bypass, 9 Charge |
+| 5 | Phase byte | u8 | `phase = max(9 − b5, 1)`; `num_phases = max(b5 − 7, 0)` (L1 frame only) |
+| 6:8 | Mains voltage | u16 | var 0 info |
+| 8:10 | Mains current | u16 | var 1 info × multiplier at offset 1 |
+| 10:12 | Inverter voltage | u16 | var 2 info |
+| 12:14 | Inverter current | u16 | var 3 info × multiplier at offset 2 |
+| 14 | Mains period | u8 | var 8 info, then `f = 10 / period` |
+
+Phase byte encoding: `0x08` = L1 of a 1-phase system, `0x09` = L1 of 2 phases, `0x0A` = L1 of 3, `0x0B` = L1 of 4; followers are `0x07` = L2, `0x06` = L3, `0x05` = L4.
+
+> ⚠ **`num_phases` is unreliable across firmwares**: the grounded-vehicle-os victron_mk3 integration observed a MultiPlus-II 2x120V reporting `num_phases = 1`, while the two-unit split-phase bench correctly reports `2` (§12). Judge topology by whether `'F' 2` returns a valid L2 frame, never by this field alone.
+
+> **Scoping (measured on the two-unit split-phase bench, §12):** the AC frames are **phase-scoped** — `'F' 1`/`'F' 2` return the same per-phase data regardless of which address is selected. The DC frame's currents are **system totals** (the ~115A charge current read via `'F' 0` was ≈ 2× the ~57A per-unit RAM var 5).
+
+Implementation: `protocol.read_dc_info()` / `protocol.read_ac_info(phase)` with pure parsers `parse_dc_info` / `parse_ac_info`.
+
 ---
 
 ## 5. Unsolicited Traffic
@@ -289,7 +341,9 @@ The MK3 continuously sends frames without being asked. Your code must handle the
 07 FF 56 28 DB 11 00 42 4E
 ```
 
-These arrive every ~100ms as heartbeats. When waiting for a command response, you need to scan through received data and skip Version frames to find the actual response. This is why all read/write functions in this project scan the response buffer for the expected subcmd byte rather than assuming the first frame received is the answer.
+These arrive every ~100ms as heartbeats **on a standalone unit**. When waiting for a command response, you need to scan through received data and skip Version frames to find the actual response. This is why all read/write functions in this project scan the response buffer for the expected subcmd byte rather than assuming the first frame received is the answer.
+
+> **Multi-unit exception (measured, §12):** a configured two-unit split-phase system emitted **no unsolicited Version heartbeats at all** (none in a 34 s trace). The same frame can always be requested explicitly with `'V'` (`02 FF 56 A9`) — `protocol.read_version()` does this.
 
 ### LED State Frames
 
@@ -684,12 +738,102 @@ The most reliable way to identify what an unknown setting controls:
 4. The changed setting ID(s) reveal what that parameter maps to
 
 ```bash
-python discover_settings.py /dev/inverter -o baseline.csv
+python settings_sweep.py /dev/inverter -o baseline.csv
 # ... change one thing in VEConfigure ...
-python discover_settings.py /dev/inverter -o after.csv
+python settings_sweep.py /dev/inverter -o after.csv
 diff baseline.csv after.csv
 ```
 
 For flag registers (Settings 0 and 1), toggle one on/off switch at a time and diff. Each toggle isolates one bit. Be aware that VEConfigure may silently change related settings when you toggle something — always change one thing at a time and verify nothing else moved unexpectedly.
 
 For RAM variables (live telemetry), read each variable multiple times and look for values that change between reads. Static values are configuration state; changing values are live measurements. Cross-reference plausible ranges for your system voltage (e.g., 48V nominal → battery voltage readings in the 4400–5800 range with ÷100 scaling).
+
+---
+
+## 12. Multi-Unit / Split-Phase Systems (single MK3)
+
+Two or more VE.Bus units configured as one system (parallel, split-phase
+120/240V, or three-phase — configured with VE.Bus Quick Configure / System
+Configurator / VictronConnect) share one bus, and **one MK3 on either unit's
+spare RJ45 port can read all of them**. Two mechanisms:
+
+1. **Address selection** — `04 FF 41 01 <addr> <chk>` (§3) points the MK3 at
+   one unit; subsequent Winmon reads (RAM vars, settings), and possibly
+   'L'/'F' frames, return that unit's values. Addresses run 0–31; which
+   addresses a given system uses is assigned at configuration time — discover
+   them empirically.
+2. **Per-phase AC frames** — `'F' 2` (§4.7) returns the L2 phase's AC data
+   (voltage, current, device state, frequency) and may work without any
+   re-addressing. On a two-unit split-phase system the L2 frame *is* the
+   second inverter.
+
+### Scanning
+
+`tui/bus_scan.py` automates discovery: it probes each address (presence test =
+address-select + Winmon read of RAM var 4), then snapshots every found unit
+(version, LEDs, all telemetry vars, 'F' 0/1/2/5) and prints the results
+side-by-side. Reading the same items under each address IS the scoping
+experiment: rows that differ follow the selected address (per-unit); identical
+rows are system-wide or master-only. Strictly read-only; always restores
+address 0 on exit.
+
+```bash
+python3 tui/bus_scan.py --mock                     # demo, no hardware
+python3 tui/bus_scan.py --port /dev/inverter -v -o scan.csv
+python3 tui/tui.py --port /dev/inverter --address 1  # watch one unit live
+```
+
+### Results matrix — measured 2026-07-02
+
+Bench: two MultiPlus-II configured split-phase 120/240V (L1 + L2), one MK3 on
+the Pi at `/dev/inverter`, system on shore power charging at ~115 A DC /
+~29 A per AC leg. Full `-v` trace + CSV: `bus_scan.txt` / `bus_scan.csv` on
+the Pi. **The pair enumerates as address 0 (L1 master) and address 1 (L2).**
+
+| Read | addr 0 | addr 1 | Verdict |
+|---|---|---|---|
+| 'V' version | 0x0011DB28 | 0x0011DB28 | Explicit-'V' request works per address (passive listening gets nothing — no heartbeats, §5). Both units run identical firmware, so version can't discriminate the pair. |
+| 'L' LEDs | Mains, Bulk | Mains, Bulk | Identical while both charge — scoping inconclusive this run. |
+| 'F' 0 DC frame | I←charger 114.9 A | 114.6 A | **System totals**: ≈ 2× the per-unit RAM var 5 (~57 A each). |
+| 'F' 1 AC L1 frame | 116.76 V / 29.52 A | 117.31 V / 28.67 A | **Phase-scoped** — answers under both addresses with L1 data (diffs are drift between reads). |
+| 'F' 2 AC L2 frame | 116.92 V / 29.32 A | 117.47 V / 29.32 A | **Phase-scoped, answers under addr 0** → L2 readable with zero re-addressing. Consistent ~0.16 V L1↔L2 gap across snapshots = genuinely two phases. |
+| 'F' 5 config (shore limit) | 50.0 A / On | 50.0 A / On | System-scoped. |
+| Winmon 0x30 RAM vars | ~57 A batt I, 3434 W DC | ~57.6 A, 3462 W | **Per-unit magnitudes** (half the system totals), and address-following all but confirmed: in the second run, addr-0 RAM 2 read 117.31 V = the L1 frame's voltage while addr-1 RAM 2 read 116.37 V = the L2 frame's voltage (exact raw matches, ~1 V apart); RAM 11 raw also differs structurally (0x4004 vs 0x8004). Both units were in near-identical charge state — a run while inverting with imbalanced leg loads would make it airtight. |
+
+Additional observations from the run:
+- `device_state` read `Charge (9)` on both phase frames (system on shore,
+  charging) — the `Slave (3)` state presumably appears on the L2 unit while
+  inverting; re-check off-shore.
+- The L1 frame reported `num_phases = 2` — **correct** here, contradicting
+  the gvos victron_mk3 observation of `1` on a 2x120V unit. Treat the field
+  as a hint, `'F' 2` as ground truth (§4.7).
+- RAM var 10 answered with subcmd `0x90` (not `0x85`) and its
+  GetVariableInfo scale is 0 → unsupported on this firmware.
+- The MK3 echoes the 'A' address-set frame even for absent addresses — the
+  echo confirms selection, not device presence; only a follow-up Winmon read
+  proves a device is there (exactly how bus_scan's presence probe works).
+- Full 0-31 sweep took 34 s live (absent addresses ≈1 s each incl. resync).
+
+**Production implication (Grounded):** inverter 2's AC status (voltage,
+current, state, frequency) is one `send_ac_request(2)` away from the existing
+gvos `inverter.py` poll loop, from address 0, with no re-addressing. Per-unit
+DC detail (power/current split) would additionally need addressed Winmon
+reads (`select_address(1)` → read vars → restore 0).
+
+### Cautions
+
+- **Always restore address 0 before exiting** (bus_scan does this in a
+  `finally:`) — an MK3 left pointed at unit 2 feeds the second unit's data to
+  whatever reader starts next. The grounded-vehicle-os `inverter.py` self-heals
+  on restart (its victron_mk3 driver re-sends `'A' [1, 0]` at startup), but
+  don't rely on every consumer doing that.
+- **A sleeping/off unit answers nothing.** Both front switches ON during scans.
+- **`num_phases` in the L1 AC frame is unreliable** on the MP-II 2x120V (§4.7)
+  — probe 'F' 2 instead.
+- **Per-unit settings writes on a configured system are discouraged** —
+  VEConfigure/VE.Bus System Configurator manage settings system-wide, and a
+  unilaterally changed unit can de-sync the system config. Reads are safe. The
+  TUI shows an extra warning in its confirm dialogs when `--address` ≠ 0.
+- On Grounded Pis, `grounded-inverter.service` holds `/dev/inverter`
+  exclusively — `sudo systemctl stop grounded-inverter` before scanning,
+  `sudo systemctl start grounded-inverter` after.

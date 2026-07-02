@@ -23,10 +23,11 @@ https://www.victronenergy.com/upload/documents/Technical-Information-Interfacing
 | Script | Purpose |
 |--------|---------|
 | `tui/tui.py` | **Interactive terminal dashboard** — live telemetry, decoded flags, charge-profile editing, guarded writes (see below) |
+| `tui/bus_scan.py` | **Read-only VE.Bus address scanner** — enumerates every unit behind one MK3 (parallel / split-phase systems), per-unit telemetry + AC/DC info frames, side-by-side report (see FINDINGS §12) |
 | `tui/vebus/protocol.py` | Reusable backend: serial/checksum/frame protocol, `SerialBackend`, `MockBackend`, and all decoders. Importable by scripts and tests |
-| `set_voltage.py` | Set absorption and float voltage (WriteViaID example) |
-| `settings_sweeper.py` | Sweep all 256 setting IDs — dump supported settings to CSV for diffing |
-| `ram_sweeper.py` | Sweep all 256 RAM variable IDs — identify live telemetry values |
+| `setv.py` | Set absorption and float voltage (WriteViaID example) |
+| `settings_sweep.py` | Sweep all 256 setting IDs — dump supported settings to CSV for diffing |
+| `ram_sweep.py` | Sweep all 256 RAM variable IDs — identify live telemetry values |
 
 The sweeper scripts are the primary tool for mapping unknown settings. Run a sweep, change one parameter in VEConfigure, sweep again, and diff the CSV outputs. See [FINDINGS.md § Methodology for Mapping Unknown Settings](FINDINGS.md#11-methodology-for-mapping-unknown-settings) for details.
 
@@ -71,10 +72,18 @@ python3 -m venv .venv
 
 # Telemetry refresh interval (seconds, default 2):
 .venv/bin/python tui/tui.py --interval 3
+
+# Watch another unit of a multi-unit (parallel/split-phase) system —
+# discover addresses with tui/bus_scan.py first:
+.venv/bin/python tui/tui.py --port /dev/inverter --address 1
 ```
 
 Keys: `r` refresh all settings · `q` quit. The status bar shows LIVE vs MOCK, the detected
-model, and the port.
+model, and the port (plus an `[ADDR n]` chip when watching a non-master unit).
+
+> With `--address` ≠ 0 the confirm dialogs carry an extra warning: per-unit
+> settings writes on a configured multi-unit system are discouraged
+> (VEConfigure manages those system-wide) — reads are safe.
 
 ### Safety
 
@@ -95,6 +104,28 @@ model, and the port.
 ```bash
 python3 tui/test_protocol.py    # unit tests, no hardware required
 ```
+
+## Multi-Unit Scanning (`tui/bus_scan.py`)
+
+Multiple VE.Bus units configured as one system (parallel or split-phase
+120/240V) share the bus, and one MK3 can read all of them — via the 'A'
+address-select command and the per-phase `'F' 2` AC frame. `bus_scan.py`
+discovers which addresses answer and dumps every unit's status side-by-side,
+strictly read-only (it always restores address 0 on exit):
+
+```bash
+# Demo against a simulated two-unit system, no hardware:
+python3 tui/bus_scan.py --mock
+
+# Real bus — hex trace + CSV, worth capturing for FINDINGS §12:
+python3 tui/bus_scan.py --port /dev/inverter -v -o scan.csv
+```
+
+Needs only pyserial (no textual). Both inverters must be switched ON — a
+sleeping unit answers nothing. If another program holds the port, stop it
+first (on Grounded Pis: `sudo systemctl stop grounded-inverter`, and start it
+again afterwards). Full background + results matrix:
+[FINDINGS.md §12](FINDINGS.md#12-multi-unit--split-phase-systems-single-mk3).
 
 ## Key Protocol Corrections
 
@@ -134,7 +165,7 @@ pip install pyserial
 
 ```python
 # Set absorption and float voltage
-from set_voltage import VoltageSettings
+from setv import VoltageSettings
 
 setter = VoltageSettings()
 setter.set_voltage(56.0, 2)  # Absorption = 56.00V
@@ -143,10 +174,10 @@ setter.set_voltage(54.0, 3)  # Float = 54.00V
 
 ```bash
 # Discover all settings on your inverter
-python settings_sweeper.py /dev/ttyUSB0 -o baseline.csv
+python settings_sweep.py /dev/ttyUSB0 -o baseline.csv
 
 # Discover live RAM variables
-python ram_sweeper.py /dev/ttyUSB0 -o ramvars.csv
+python ram_sweep.py /dev/ttyUSB0 -o ramvars.csv
 ```
 
 **Note:** Writes go to EEPROM which has limited write cycles. These tools are for configuration and discovery, not automation loops.

@@ -352,5 +352,218 @@ class TestMockBackend(unittest.TestCase):
         self.assertGreater(len(set(reads)), 1)
 
 
+class TestAddressFrame(unittest.TestCase):
+    def test_address0_is_exact_legacy_frame(self):
+        # Must be byte-identical to the init frame every tool has always sent.
+        self.assertEqual(p.build_address_frame(0),
+                         bytes([0x04, 0xFF, 0x41, 0x01, 0x00, 0xBB]))
+
+    def test_address1_frame(self):
+        self.assertEqual(p.build_address_frame(1),
+                         bytes([0x04, 0xFF, 0x41, 0x01, 0x01, 0xBA]))
+
+    def test_all_addresses_sum_to_zero_mod_256(self):
+        for addr in range(32):
+            self.assertEqual(sum(p.build_address_frame(addr)) % 256, 0)
+
+    def test_out_of_range_raises(self):
+        with self.assertRaises(ValueError):
+            p.build_address_frame(32)
+        with self.assertRaises(ValueError):
+            p.build_address_frame(-1)
+
+    def test_version_request_frame(self):
+        # Explicit 'V' request — same frame gvos inverter.py validates with.
+        self.assertEqual(p.build_frame(bytes([0xFF, p.RSP_VERSION])),
+                         bytes([0x02, 0xFF, 0x56, 0xA9]))
+
+
+class TestParseBytes(unittest.TestCase):
+    def test_24bit_negative_current(self):
+        # 0xFFFFF6 = -10 raw; battery-current scale 0.1 → -1.0 A.
+        info = p.RamVarInfo(signed=True, scale=0.1, offset=0)
+        self.assertAlmostEqual(info.parse_bytes(b"\xf6\xff\xff"), -1.0)
+
+    def test_24bit_positive_current(self):
+        info = p.RamVarInfo(signed=True, scale=0.1, offset=0)
+        self.assertAlmostEqual(info.parse_bytes(b"\x0f\x00\x00"), 1.5)
+
+    def test_16bit_matches_parse(self):
+        info = p.RamVarInfo(signed=True, scale=0.1, offset=0)
+        self.assertAlmostEqual(info.parse_bytes(b"\xea\xff"), info.parse(0xFFEA))
+
+    def test_16bit_unsigned_voltage(self):
+        info = p.RamVarInfo(signed=False, scale=0.01, offset=0)
+        self.assertAlmostEqual(info.parse_bytes(b"\xb6\x14"), 53.02)
+
+    def test_1byte_signed(self):
+        info = p.RamVarInfo(signed=True, scale=1.0, offset=0)
+        self.assertEqual(info.parse_bytes(b"\x80"), -128.0)
+        self.assertEqual(info.parse_bytes(b"\x7f"), 127.0)
+
+    def test_1byte_period_with_offset(self):
+        # Inverter period: scale 0.000512, offset 256; raw 70 → ~0.167 s → ~60 Hz.
+        info = p.RamVarInfo(signed=False, scale=0.000512, offset=256)
+        period = info.parse_bytes(b"\x46")
+        self.assertTrue(59 < p.period_to_frequency(period) < 61)
+
+    def test_wrong_width_raises(self):
+        info = p.RamVarInfo(signed=False, scale=1.0, offset=0)
+        with self.assertRaises(ValueError):
+            info.parse_bytes(b"")
+        with self.assertRaises(ValueError):
+            info.parse_bytes(b"\x00\x00\x00\x00")
+
+
+class TestDcAcInfoParsing(unittest.TestCase):
+    """Synthetic info frames built with the exact victron_mk3 byte offsets."""
+
+    DC_INFOS = {4: p.RamVarInfo(False, 0.01, 0),
+                5: p.RamVarInfo(True, 0.1, 0),
+                7: p.RamVarInfo(False, 0.000512, 256)}
+    AC_INFOS = {0: p.RamVarInfo(False, 0.01, 0),
+                1: p.RamVarInfo(True, 0.01, 0),
+                2: p.RamVarInfo(False, 0.01, 0),
+                3: p.RamVarInfo(True, 0.01, 0),
+                8: p.RamVarInfo(False, 0.001024, 0)}
+
+    @staticmethod
+    def _u16(v):
+        return bytes([v & 0xFF, (v >> 8) & 0xFF])
+
+    @staticmethod
+    def _u24(v):
+        return bytes([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF])
+
+    def _dc_payload(self, volts_raw=5302, to_inv=15, from_chg=0, period=70):
+        return (bytes([0x20, 0, 0, 0, 0, p.DC_FRAME_TYPE])
+                + self._u16(volts_raw) + self._u24(to_inv & 0xFFFFFF)
+                + self._u24(from_chg & 0xFFFFFF) + bytes([period]))
+
+    def _ac_payload(self, phase_byte, state=8, mains_mult=1, inv_mult=1,
+                    mains_v=12013, mains_i=820, inv_v=12000, inv_i=790,
+                    period=162):
+        return (bytes([0x20, mains_mult, inv_mult, 0, state, phase_byte])
+                + self._u16(mains_v) + self._u16(mains_i)
+                + self._u16(inv_v) + self._u16(inv_i) + bytes([period]))
+
+    def test_payloads_are_wire_valid(self):
+        # build_frame wraps a payload with length + checksum summing to 0.
+        for payload in (self._dc_payload(), self._ac_payload(0x08)):
+            self.assertEqual(sum(p.build_frame(payload)) % 256, 0)
+
+    def test_dc_frame_decodes(self):
+        dc = p.parse_dc_info(self._dc_payload(), self.DC_INFOS)
+        self.assertIsNotNone(dc)
+        self.assertAlmostEqual(dc.dc_voltage, 53.02)
+        self.assertAlmostEqual(dc.dc_current_to_inverter, 1.5)
+        self.assertAlmostEqual(dc.dc_current_from_charger, 0.0)
+        self.assertAlmostEqual(dc.dc_current, -1.5)  # net: discharging
+        self.assertTrue(59 < dc.inverter_frequency < 61)
+
+    def test_dc_24bit_negative_current(self):
+        dc = p.parse_dc_info(self._dc_payload(to_inv=-10), self.DC_INFOS)
+        self.assertAlmostEqual(dc.dc_current_to_inverter, -1.0)
+
+    def test_ac_l1_frame(self):
+        ac = p.parse_ac_info(self._ac_payload(0x08, state=8), self.AC_INFOS)
+        self.assertEqual(ac.phase, 1)
+        self.assertEqual(ac.num_phases, 1)
+        self.assertEqual(ac.device_state_name, "Bypass")
+        self.assertAlmostEqual(ac.mains_voltage, 120.13)
+        self.assertAlmostEqual(ac.mains_current, 8.2)
+        self.assertAlmostEqual(ac.inverter_voltage, 120.0)
+        self.assertAlmostEqual(ac.inverter_current, 7.9)
+        self.assertTrue(59 < ac.mains_frequency < 61)
+
+    def test_ac_l2_frame_slave_state(self):
+        ac = p.parse_ac_info(self._ac_payload(0x07, state=3), self.AC_INFOS)
+        self.assertEqual(ac.phase, 2)
+        self.assertEqual(ac.num_phases, 0)   # only the L1 frame reports it
+        self.assertEqual(ac.device_state_name, "Slave")
+
+    def test_ac_current_multipliers(self):
+        ac = p.parse_ac_info(self._ac_payload(0x08, mains_mult=2, inv_mult=3),
+                             self.AC_INFOS)
+        self.assertAlmostEqual(ac.mains_current, 16.4)   # 8.2 × 2
+        self.assertAlmostEqual(ac.inverter_current, 23.7)  # 7.9 × 3
+
+    def test_parsers_reject_wrong_frames(self):
+        self.assertIsNone(p.parse_dc_info(self._ac_payload(0x08), self.DC_INFOS))
+        self.assertIsNone(p.parse_ac_info(self._dc_payload(), self.AC_INFOS))
+        self.assertIsNone(p.parse_dc_info(self._dc_payload()[:10], self.DC_INFOS))
+        bad_marker = b"\x21" + self._dc_payload()[1:]
+        self.assertIsNone(p.parse_dc_info(bad_marker, self.DC_INFOS))
+
+    def test_parsers_fall_back_to_default_scaling(self):
+        # No infos passed → DEFAULT_RAMVAR_INFO scales apply.
+        dc = p.parse_dc_info(self._dc_payload())
+        self.assertAlmostEqual(dc.dc_voltage, 53.02)
+
+
+class TestMockMultiUnit(unittest.TestCase):
+    def setUp(self):
+        self.b = p.MockBackend()
+        self.b.open()
+
+    def test_two_units_present(self):
+        self.assertIsNotNone(self.b.read_ramvar(4))
+        self.b.select_address(1)
+        self.assertIsNotNone(self.b.read_ramvar(4))
+
+    def test_absent_address_is_silent(self):
+        self.b.select_address(5)
+        self.assertIsNone(self.b.read_ramvar(4))
+        self.assertIsNone(self.b.read_version())
+        self.assertIsNone(self.b.read_leds())
+        self.assertIsNone(self.b.read_config())
+        self.assertIsNone(self.b.read_dc_info())
+        self.assertIsNone(self.b.read_ac_info(1))
+        self.assertIsNone(self.b.read_setting(0))
+        self.b.select_address(0)  # back to master: alive again
+        self.assertIsNotNone(self.b.read_ramvar(4))
+
+    def test_per_address_values_differ_but_battery_shared(self):
+        mains0 = self.b.read_ramvar(0)
+        batt0 = self.b.read_ramvar(4)
+        self.b.select_address(1)
+        mains1 = self.b.read_ramvar(0)
+        batt1 = self.b.read_ramvar(4)
+        self.assertGreater(abs(mains0 - mains1), 100)  # distinct AC side
+        self.assertLess(abs(batt0 - batt1), 10)        # shared bank (drift only)
+
+    def test_version_and_leds_differ_per_address(self):
+        v0, l0 = self.b.read_version(), self.b.read_leds()
+        self.b.select_address(1)
+        v1, l1 = self.b.read_version(), self.b.read_leds()
+        self.assertNotEqual(v0, v1)
+        self.assertNotEqual((l0.on, l0.blink), (l1.on, l1.blink))
+
+    def test_ac_frames_phase_scoped(self):
+        ac1 = self.b.read_ac_info(1)
+        ac2 = self.b.read_ac_info(2)
+        self.assertEqual(ac1.phase, 1)
+        self.assertEqual(ac1.num_phases, 1)  # MP-II 2x120V quirk baked in
+        self.assertEqual(ac2.phase, 2)
+        self.assertEqual(ac2.device_state_name, "Slave")
+        self.assertIsNone(self.b.read_ac_info(3))  # split-phase pair: no L3
+        with self.assertRaises(ValueError):
+            self.b.read_ac_info(0)
+
+    def test_select_address_validates(self):
+        with self.assertRaises(ValueError):
+            self.b.select_address(32)
+
+    def test_description_reflects_address(self):
+        self.assertNotIn("addr", self.b.description)
+        self.b.select_address(1)
+        self.assertIn("addr 1", self.b.description)
+
+    def test_open_backend_threads_address(self):
+        b = p.open_backend(mock=True, address=1)
+        self.assertEqual(b.address, 1)
+        self.assertIsNotNone(b.read_ramvar(4))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

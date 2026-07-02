@@ -10,6 +10,8 @@ verified by readback.
     python3 tui.py                 # auto: try /dev/ttyUSB0, else mock
     python3 tui.py --port /dev/inverter
     python3 tui.py --mock          # no hardware needed
+    python3 tui.py --address 1     # watch another unit of a multi-unit system
+                                   # (discover addresses with bus_scan.py)
 
 Run inside the project venv:  .venv/bin/python tui.py
 See README.md for the safety note about EEPROM writes.
@@ -167,6 +169,12 @@ class VEBusTUI(App):
         self._tele_busy = False        # guard: skip a tick if one is in flight
         self._tele_started = False      # telemetry interval starts after 1st load
         self._last_cfg: Optional[p.ConfigInfo] = None  # last shore-config snapshot
+        addr = getattr(backend, "address", 0)
+        self._addr_warning = "" if not addr else (
+            f"Target is ADDRESSED unit {addr} of a configured multi-unit "
+            "system. Per-unit settings writes on a paired system are "
+            "discouraged (VEConfigure manages these system-wide); reads are "
+            "safe.")
 
     # ── layout ────────────────────────────────────────────────────────────────
 
@@ -255,6 +263,9 @@ class VEBusTUI(App):
     # ── lifecycle ───────────────────────────────────────────────────────────
 
     def on_mount(self) -> None:
+        addr = getattr(self.backend, "address", 0)
+        if addr:
+            self.sub_title = f"VE.Bus address {addr}"
         # Column headers.
         self.query_one("#telemetry", DataTable).add_columns(
             "ID", "Measurement", "Raw", "Value")
@@ -280,18 +291,20 @@ class VEBusTUI(App):
         d = self.device
         model = d.model if d else "…"
         fw = f"  fw {d.firmware}" if d and d.firmware else ""
+        addr = getattr(self.backend, "address", 0)
+        chip = f"[b][ADDR {addr}][/b]  " if addr else ""
         if self.backend.is_mock:
             bar.set_classes(["mock"])
-            bar.update(f"● MOCK MODE — no device  |  {self.backend.description}  "
+            bar.update(f"{chip}● MOCK MODE — no device  |  {self.backend.description}  "
                        f"|  model: {model}{fw}")
         elif not self.backend.healthy:
             bar.set_classes(["mock"])  # reuse warning style
-            bar.update("⚠ NO RESPONSE — bus silent/desynced. Press 'y' to resync, "
+            bar.update(f"{chip}⚠ NO RESPONSE — bus silent/desynced. Press 'y' to resync, "
                        "or check no other program (VEConfigure, another tui.py) "
                        f"holds {self.backend.description}.")
         else:
             bar.set_classes(["live"])
-            bar.update(f"● LIVE — {self.backend.description}  |  model: {model}{fw}")
+            bar.update(f"{chip}● LIVE — {self.backend.description}  |  model: {model}{fw}")
 
     # ── refresh: telemetry (periodic, reads only) ───────────────────────────
 
@@ -454,10 +467,16 @@ class VEBusTUI(App):
 
     # ── write helpers ─────────────────────────────────────────────────────────
 
+    def _addr_note(self) -> str:
+        """Extra confirm-modal text when driving a non-master bus address."""
+        return (f"\n\n[yellow]⚠ {self._addr_warning}[/yellow]"
+                if self._addr_warning else "")
+
     async def _confirm_and_write(self, setting_id: int, new: int,
                                  warning: str = "") -> bool:
         """Show confirm modal, write if confirmed, verify, refresh. Returns ok."""
         old = self.settings.get(setting_id)
+        warning = "\n".join(w for w in (warning, self._addr_warning) if w)
         choice = await self.push_screen_wait(
             ConfirmWrite(setting_id, old, new, warning))
         if choice is None:
@@ -597,7 +616,8 @@ class VEBusTUI(App):
         ok = await self.push_screen_wait(_ConfirmText(
             f"Set shore power (AC input) current limit to [b]{amps:.1f} A[/b]?{rng}{sw}\n\n"
             "Uses the runtime 'S' command — not EEPROM. The value may reset to the "
-            "configured default if the unit sleeps or loses VE.Bus power."))
+            "configured default if the unit sleeps or loses VE.Bus power."
+            + self._addr_note()))
         if not ok:
             return
         res = await asyncio.to_thread(self.backend.set_current_limit, amps, True)
@@ -610,7 +630,8 @@ class VEBusTUI(App):
         name = p.STATE_NAMES.get(state, str(state))
         ok = await self.push_screen_wait(
             _ConfirmText(f"Set operating state to:\n\n  [b]{name}[/b]\n\n"
-                         f"This changes inverter operation immediately."))
+                         f"This changes inverter operation immediately."
+                         + self._addr_note()))
         if not ok:
             return
         await asyncio.to_thread(self.backend.set_state, state)
@@ -713,21 +734,23 @@ class _ConfirmText(ModalScreen[bool]):
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-def open_backend_with_candidates(port: str, mock: bool, fallback: bool) -> p.Backend:
+def open_backend_with_candidates(port: str, mock: bool, fallback: bool,
+                                 address: int = 0) -> p.Backend:
     """Try the requested port, then /dev/inverter, then (optionally) mock."""
     if mock:
-        return p.open_backend(mock=True)
+        return p.open_backend(mock=True, address=address)
     candidates = [port]
     if "/dev/inverter" not in candidates:
         candidates.append("/dev/inverter")
     last_err = None
     for cand in candidates:
         try:
-            return p.open_backend(port=cand, mock=False, fallback_to_mock=False)
+            return p.open_backend(port=cand, mock=False, fallback_to_mock=False,
+                                  address=address)
         except Exception as e:  # try next candidate
             last_err = e
     if fallback:
-        b = p.MockBackend()
+        b = p.MockBackend(address=address)
         b.open()
         b.description = f"MOCK (fallback — no port opened: {last_err})"
         return b
@@ -744,10 +767,16 @@ def main() -> None:
                     help="do not fall back to mock if the port can't be opened")
     ap.add_argument("--interval", type=float, default=2.0,
                     help="telemetry auto-refresh interval, seconds (default 2)")
+    ap.add_argument("--address", type=int, default=0,
+                    help="VE.Bus device address 0-31 (default 0 = master/"
+                         "standalone; discover other units with bus_scan.py)")
     args = ap.parse_args()
+    if not 0 <= args.address <= 31:
+        ap.error(f"--address must be 0-31, got {args.address}")
 
     backend = open_backend_with_candidates(
-        args.port, mock=args.mock, fallback=not args.no_fallback)
+        args.port, mock=args.mock, fallback=not args.no_fallback,
+        address=args.address)
     try:
         VEBusTUI(backend, refresh_interval=args.interval).run()
     finally:

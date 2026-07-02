@@ -22,7 +22,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 try:
     import serial  # type: ignore
@@ -49,12 +49,20 @@ RSP_READ_RAMVAR = 0x85
 CMD_GET_RAMVAR_INFO = 0x36   # X-slot: 05 FF 58 36 <id_lo> <id_hi> <chk>
 RSP_RAMVAR_INFO_SCALE = 0x8E
 RSP_RAMVAR_INFO_OFFSET = 0x8F
-CMD_CONFIG = 0x46            # 'F' — arg 5 = GetConfig; response type byte 0x41
+CMD_CONFIG = 0x46            # 'F' — arg 0=DC, 1-4=AC phase, 5=GetConfig
 RSP_CONFIG = 0x41
 CMD_LED = 0x4C              # 'L' — response FF 4C <on> <blink> ...
 RSP_LED = 0x4C
 CMD_STATE = 0x53            # 'S' — switch state (+ current limit, long form)
 RSP_VERSION = 0x56
+CMD_ADDRESS = 0x41          # 'A' — select the target VE.Bus device
+ADDR_SUBCMD_SET = 0x01      # byte after 'A': 0x01 = set address (0x00 = read)
+
+# DC/AC info frames ('F' 0-4 responses) start with 0x20, NOT 0xFF.
+INFO_FRAME_MARKER = 0x20
+DC_FRAME_TYPE = 0x0C        # payload[5] marking the DC frame
+AC_PHASE_BYTE_MIN = 0x05    # payload[5] 0x05..0x0B encodes the AC phase
+AC_PHASE_BYTE_MAX = 0x0B
 
 # Switch states for the long-form 'S' command (matches victron_mk3 SwitchState).
 SWITCH_CHARGER_ONLY = 1
@@ -89,6 +97,22 @@ def build_frame(payload: bytes) -> bytes:
     length = len(payload)
     head = bytes([length]) + payload
     return head + bytes([calculate_checksum(head)])
+
+
+def build_address_frame(addr: int) -> bytes:
+    """
+    'A' (Address Set) frame: ``04 FF 41 01 <addr> <chk>``.
+
+    The byte after 0x41 is the subcommand (0x01 = set), then the device
+    address. Address 0 is a standalone unit / the system master —
+    build_address_frame(0) is byte-identical to the legacy init frame
+    ``04 FF 41 01 00 BB`` every tool here has always sent. Other units of a
+    configured parallel/split-phase system live at other addresses
+    (FINDINGS §12); subsequent Winmon reads target the selected unit.
+    """
+    if not 0 <= addr <= 0x1F:
+        raise ValueError(f"VE.Bus address must be 0-31, got {addr}")
+    return build_frame(bytes([0xFF, CMD_ADDRESS, ADDR_SUBCMD_SET, addr]))
 
 
 def scan_value_response(data: bytes, subcmd: int) -> Optional[int]:
@@ -281,6 +305,16 @@ STATE_NAMES = {
     0x03: "Normal (auto)",
 }
 
+# Per-unit operating state carried in the AC info frames ('F' 1-4), payload
+# byte 4 (victron_mk3 DeviceState). Distinct from STATE_NAMES (the 'S' switch
+# state). Non-master units of a configured multi-unit system typically report
+# Slave (3).
+DEVICE_STATE_NAMES = {
+    0: "Down", 1: "Startup", 2: "Off", 3: "Slave", 4: "Invert full",
+    5: "Invert half", 6: "Invert AES", 7: "Power assist", 8: "Bypass",
+    9: "Charge",
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RAM telemetry interpretation
@@ -309,6 +343,23 @@ class RamVarInfo:
         if self.bit is not None:
             return 1.0 if (raw_u16 & (1 << self.bit)) else 0.0
         v = signed16(raw_u16) if self.signed else raw_u16
+        return self.scale * (v + self.offset)
+
+    def parse_bytes(self, raw: bytes) -> float:
+        """
+        Parse a 1/2/3-byte little-endian field, sign-extending per width when
+        signed. The DC/AC info frames carry 24-bit currents and 1-byte periods,
+        which the u16-only parse() can't handle. Ported from victron_mk3
+        VariableInfo.parse.
+        """
+        if self.bit is not None:
+            return 1.0 if (int.from_bytes(raw, "little") & (1 << self.bit)) else 0.0
+        sign_at = {1: 0x80, 2: 0x8000, 3: 0x800000}
+        if len(raw) not in sign_at:
+            raise ValueError(f"expected 1-3 bytes, got {len(raw)}")
+        v = int.from_bytes(raw, "little")
+        if self.signed and v >= sign_at[len(raw)]:
+            v -= sign_at[len(raw)] << 1
         return self.scale * (v + self.offset)
 
 
@@ -523,6 +574,116 @@ def parse_config(payload: bytes) -> Optional[ConfigInfo]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DC / AC info frames ('F' 0-4 → 0x20 frames)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# GetVariableInfo scaling as measured on the real MultiPlus II (FINDINGS §7.7).
+# Used by MockBackend, and as a per-variable fallback when live 0x36 info is
+# unavailable (info-frame parsing needs var 0-8 scales).
+DEFAULT_RAMVAR_INFO: dict[int, RamVarInfo] = {
+    0: RamVarInfo(False, 0.01, 0), 1: RamVarInfo(True, 0.01, 0),
+    2: RamVarInfo(False, 0.01, 0), 3: RamVarInfo(True, 0.01, 0),
+    4: RamVarInfo(False, 0.01, 0), 5: RamVarInfo(True, 0.1, 0),
+    6: RamVarInfo(False, 0.01, 0), 7: RamVarInfo(False, 0.000512, 256),
+    8: RamVarInfo(False, 0.001024, 0), 9: RamVarInfo(True, 0.01, 0),
+    11: RamVarInfo(bit=4), 12: RamVarInfo(bit=5),
+    13: RamVarInfo(False, 0.005, 0),  # SoC: fractional, normalized to %
+    14: RamVarInfo(True, 1.0, 0), 15: RamVarInfo(True, 1.0, 0),
+    16: RamVarInfo(True, 1.0, 0),
+}
+
+
+def _info_scale(infos: Optional[dict], var_id: int) -> RamVarInfo:
+    """Live GetVariableInfo scale when available, else the measured default."""
+    info = (infos or {}).get(var_id)
+    return info if info is not None else DEFAULT_RAMVAR_INFO[var_id]
+
+
+@dataclass
+class DcInfo:
+    """Decoded DC info frame ('F' 0) — the battery-side view of one unit."""
+    dc_voltage: float
+    dc_current_to_inverter: float
+    dc_current_from_charger: float
+    inverter_frequency: float
+
+    @property
+    def dc_current(self) -> float:
+        """Net battery current: + charging, − discharging (like RAM var 5)."""
+        return self.dc_current_from_charger - self.dc_current_to_inverter
+
+
+@dataclass
+class AcInfo:
+    """Decoded AC info frame ('F' 1-4) for one phase (L1=1 … L4=4)."""
+    phase: int
+    num_phases: int          # only populated on the L1 frame — and see caveat
+    device_state: int        # DEVICE_STATE_NAMES code (per-unit, e.g. Slave)
+    mains_voltage: float
+    mains_current: float
+    inverter_voltage: float
+    inverter_current: float
+    mains_frequency: float
+
+    @property
+    def device_state_name(self) -> str:
+        return DEVICE_STATE_NAMES.get(self.device_state,
+                                      f"? ({self.device_state})")
+
+
+def parse_dc_info(payload: bytes,
+                  infos: Optional[dict[int, RamVarInfo]] = None) -> Optional[DcInfo]:
+    """
+    Decode a DC info frame payload (bytes after the length byte, checksum
+    stripped): 0x20 marker, payload[5]=0x0C, battery V u16 at 6:8 (var-4
+    scale), current→inverter u24 at 8:11 and ←charger u24 at 11:14 (var-5
+    scale), inverter period byte at 14 (var-7 scale, f = 10/period).
+    Byte offsets ported from victron_mk3 (inverter.py's protocol library).
+    """
+    if (len(payload) < 15 or payload[0] != INFO_FRAME_MARKER
+            or payload[5] != DC_FRAME_TYPE):
+        return None
+    return DcInfo(
+        dc_voltage=_info_scale(infos, 4).parse_bytes(payload[6:8]),
+        dc_current_to_inverter=_info_scale(infos, 5).parse_bytes(payload[8:11]),
+        dc_current_from_charger=_info_scale(infos, 5).parse_bytes(payload[11:14]),
+        inverter_frequency=period_to_frequency(
+            _info_scale(infos, 7).parse_bytes(payload[14:15])),
+    )
+
+
+def parse_ac_info(payload: bytes,
+                  infos: Optional[dict[int, RamVarInfo]] = None) -> Optional[AcInfo]:
+    """
+    Decode an AC info frame payload: 0x20 marker; payload[5] encodes the phase
+    (0x05→L4 … 0x08→L1: phase = max(9 − b5, 1)) and, on the L1 frame only,
+    num_phases = max(b5 − 7, 0). Device state at byte 4. Mains V/I at 6:8 /
+    8:10 (current × payload[1] multiplier), inverter V/I at 10:12 / 12:14
+    (current × payload[2]), mains period byte at 14. Offsets ported from
+    victron_mk3.
+
+    CAVEAT: num_phases is unreliable across firmwares — the gvos victron_mk3
+    integration observed a MultiPlus-II 2x120V reporting 1, while the two-unit
+    split-phase bench correctly reports 2 (FINDINGS §12). Judge topology by
+    whether 'F' 2 returns a valid frame, never by this field alone.
+    """
+    if (len(payload) < 15 or payload[0] != INFO_FRAME_MARKER
+            or not (AC_PHASE_BYTE_MIN <= payload[5] <= AC_PHASE_BYTE_MAX)):
+        return None
+    return AcInfo(
+        phase=max(9 - payload[5], 1),
+        num_phases=max(payload[5] - 7, 0),
+        device_state=payload[4],
+        mains_voltage=_info_scale(infos, 0).parse_bytes(payload[6:8]),
+        mains_current=_info_scale(infos, 1).parse_bytes(payload[8:10]) * payload[1],
+        inverter_voltage=_info_scale(infos, 2).parse_bytes(payload[10:12]),
+        inverter_current=_info_scale(infos, 3).parse_bytes(payload[12:14]) * payload[2],
+        mains_frequency=period_to_frequency(
+            _info_scale(infos, 8).parse_bytes(payload[14:15])),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Value scaling + input validation
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -680,6 +841,7 @@ class Backend:
     connected: bool = False
     is_mock: bool = False
     description: str = ""
+    address: int = 0        # currently selected VE.Bus device address
     _healthy: bool = True
 
     @property
@@ -715,6 +877,20 @@ class Backend:
 
     def read_leds(self) -> Optional["LedInfo"]:
         """Front-panel LED on/blink state. None if unavailable."""
+        return None
+
+    def select_address(self, addr: int) -> None:
+        """Select which VE.Bus device (0-31) subsequent reads target."""
+        if not 0 <= addr <= 0x1F:
+            raise ValueError(f"VE.Bus address must be 0-31, got {addr}")
+        self.address = addr
+
+    def read_dc_info(self) -> Optional["DcInfo"]:
+        """DC info frame ('F' 0). None if unavailable."""
+        return None
+
+    def read_ac_info(self, phase: int = 1) -> Optional["AcInfo"]:
+        """AC info frame ('F' 1-4) for the given phase. None if unavailable."""
         return None
 
     def set_current_limit(self, amps: float, verify: bool = True) -> "WriteResult":
@@ -759,16 +935,23 @@ class SerialBackend(Backend):
     POST_CMD_SLEEP = 0.1
     WRITE_SLEEP = 0.2
 
-    def __init__(self, port: str = "/dev/ttyUSB0", baudrate: int = 2400):
+    def __init__(self, port: str = "/dev/ttyUSB0", baudrate: int = 2400,
+                 address: int = 0):
         if serial is None:
             raise RuntimeError("pyserial is not installed; cannot use SerialBackend.")
+        if not 0 <= address <= 0x1F:
+            raise ValueError(f"VE.Bus address must be 0-31, got {address}")
         self.port = port
         self.baudrate = baudrate
+        self.address = address
         self.ser: Optional["serial.Serial"] = None
         self._lock = threading.Lock()
         self.is_mock = False
         self._healthy = True  # last command saw a live bus (Version frames/response)
         self._ramvar_info: dict[int, Optional[RamVarInfo]] = {}  # cached 0x36 results
+        # Optional hook receiving ("TX"|"RX", bytes) for every write/read —
+        # lets bus_scan.py -v capture a hex trace without a protocol change.
+        self.trace: Optional[Callable[[str, bytes], None]] = None
 
     # ── lifecycle ───────────────────────────────────────────────────────────
 
@@ -800,7 +983,18 @@ class SerialBackend(Backend):
         with self._lock:
             self._resync()
         self.connected = True
-        self.description = f"{self.port} @ {self.baudrate} 8N1"
+        self.description = self._describe()
+
+    def _describe(self) -> str:
+        base = f"{self.port} @ {self.baudrate} 8N1"
+        return f"{base}  addr {self.address}" if self.address else base
+
+    def _trace(self, direction: str, data: bytes) -> None:
+        if self.trace is not None and data:
+            try:
+                self.trace(direction, bytes(data))
+            except Exception:
+                pass
 
     def _resync(self) -> None:
         """
@@ -819,9 +1013,13 @@ class SerialBackend(Backend):
             self.ser.reset_output_buffer()
         except Exception:
             pass
-        self.ser.write(bytes([0x55] * 5))   # sync / framing realignment
+        sync = bytes([0x55] * 5)
+        self._trace("TX", sync)
+        self.ser.write(sync)   # sync / framing realignment
         time.sleep(0.05)
-        self.ser.write(bytes([0x04, 0xFF, 0x41, 0x01, 0x00, 0xBB]))  # address set
+        addr_frame = build_address_frame(self.address)  # 04 FF 41 01 <addr> <chk>
+        self._trace("TX", addr_frame)
+        self.ser.write(addr_frame)
         time.sleep(0.2)
         try:
             if self.ser.in_waiting:
@@ -841,11 +1039,37 @@ class SerialBackend(Backend):
 
     def _send(self, frame: bytes) -> Optional[bytes]:
         assert self.ser is not None
+        self._trace("TX", frame)
         self.ser.write(frame)
         time.sleep(self.POST_CMD_SLEEP)
         if self.ser.in_waiting:
-            return self.ser.read(self.ser.in_waiting)
+            resp = self.ser.read(self.ser.in_waiting)
+            self._trace("RX", resp)
+            return resp
         return None
+
+    def select_address(self, addr: int) -> None:
+        """
+        Point the MK3 at another VE.Bus device (0-31); subsequent reads target
+        the selected unit. Clears the GetVariableInfo cache (scaling is
+        per-device — stale info would silently mis-scale the other unit) and
+        drains the input buffer so a late frame from the previous unit can't be
+        attributed to the new one.
+        """
+        frame = build_address_frame(addr)  # validates 0-31
+        with self._lock:
+            self.address = addr
+            self._ramvar_info.clear()
+            assert self.ser is not None
+            self._trace("TX", frame)
+            self.ser.write(frame)
+            time.sleep(0.15)
+            try:
+                if self.ser.in_waiting:
+                    self._trace("RX", self.ser.read(self.ser.in_waiting))
+            except Exception:
+                pass
+        self.description = self._describe()
 
     def _command_value(self, payload: bytes, resp_subcmd: int) -> Optional[int]:
         """
@@ -954,6 +1178,7 @@ class SerialBackend(Backend):
         while time.monotonic() < deadline:
             chunk = self.ser.read(self.ser.in_waiting or 1)
             if chunk:
+                self._trace("RX", chunk)
                 buf += chunk
             i = 0
             n = len(buf)
@@ -980,6 +1205,7 @@ class SerialBackend(Backend):
         with self._lock:
             for _ in range(self.READ_RETRIES):
                 self.ser.reset_input_buffer()
+                self._trace("TX", frame)
                 self.ser.write(frame)
                 payload = self._read_synced(
                     lambda p: len(p) >= 13 and p[0] == RSP_CONFIG, timeout=1.0)
@@ -989,11 +1215,60 @@ class SerialBackend(Backend):
                 time.sleep(0.05)
         return None
 
+    def read_dc_info(self) -> Optional[DcInfo]:
+        """DC info frame ('F' 0): battery V, currents to/from, inverter freq."""
+        # Gather scaling first — read_ramvar_info takes the lock itself.
+        infos = {v: self.read_ramvar_info(v) for v in (4, 5, 7)}
+        frame = build_frame(bytes([0xFF, CMD_CONFIG, 0x00]))  # 'F' 0 = DC frame
+        with self._lock:
+            for _ in range(self.READ_RETRIES):
+                self.ser.reset_input_buffer()
+                self._trace("TX", frame)
+                self.ser.write(frame)
+                payload = self._read_synced(
+                    lambda p: (len(p) >= 15 and p[0] == INFO_FRAME_MARKER
+                               and p[5] == DC_FRAME_TYPE),
+                    timeout=1.0)
+                if payload:
+                    self._healthy = True
+                    return parse_dc_info(payload, infos)
+                time.sleep(0.05)
+        return None
+
+    def read_ac_info(self, phase: int = 1) -> Optional[AcInfo]:
+        """
+        AC info frame ('F' 1-4) for one phase. On a split-phase (120/240V)
+        pair, 'F' 2 is the L2 unit's AC data. An absent phase simply never
+        answers — expect the full timeout, not an error.
+        """
+        if not 1 <= phase <= 4:
+            raise ValueError(f"AC phase must be 1-4, got {phase}")
+        infos = {v: self.read_ramvar_info(v) for v in (0, 1, 2, 3, 8)}
+        frame = build_frame(bytes([0xFF, CMD_CONFIG, phase]))  # 'F' <phase>
+
+        def _match(p: bytes) -> bool:
+            return (len(p) >= 15 and p[0] == INFO_FRAME_MARKER
+                    and AC_PHASE_BYTE_MIN <= p[5] <= AC_PHASE_BYTE_MAX
+                    and max(9 - p[5], 1) == phase)
+
+        with self._lock:
+            for _ in range(self.READ_RETRIES):
+                self.ser.reset_input_buffer()
+                self._trace("TX", frame)
+                self.ser.write(frame)
+                payload = self._read_synced(_match, timeout=1.0)
+                if payload:
+                    self._healthy = True
+                    return parse_ac_info(payload, infos)
+                time.sleep(0.05)
+        return None
+
     def read_leds(self) -> Optional[LedInfo]:
         frame = build_frame(bytes([0xFF, CMD_LED]))  # 'L'
         with self._lock:
             for _ in range(self.READ_RETRIES):
                 self.ser.reset_input_buffer()
+                self._trace("TX", frame)
                 self.ser.write(frame)
                 payload = self._read_synced(
                     lambda p: len(p) >= 4 and p[0] == 0xFF and p[1] == RSP_LED,
@@ -1035,17 +1310,28 @@ class SerialBackend(Backend):
 
     def read_version(self) -> Optional[int]:
         """
-        Parse an unsolicited Version frame: 07 FF 56 <ver[4 LE]> <mode> <chk>.
-        These arrive ~every 100ms, so grab a ~300ms window and scan it.
+        Read the firmware version: send an explicit 'V' request (02 FF 56 A9)
+        and scan for the FF 56 reply: 07 FF 56 <ver[4 LE]> <mode> <chk>.
+
+        A standalone unit also broadcasts this frame unsolicited every ~100ms,
+        but a configured split-phase system was observed to emit NO heartbeats
+        at all (FINDINGS §12) — so a passive listen is not enough; always ask.
         """
         assert self.ser is not None
+        frame = build_frame(bytes([0xFF, RSP_VERSION]))  # 'V'
         with self._lock:
-            time.sleep(0.2)
-            data = self.ser.read(max(self.ser.in_waiting, 24))
-        for i in range(len(data) - 6):
-            if data[i + 1] == 0xFF and data[i + 2] == RSP_VERSION:
-                return (data[i + 3] | (data[i + 4] << 8)
-                        | (data[i + 5] << 16) | (data[i + 6] << 24))
+            for _ in range(self.READ_RETRIES):
+                self.ser.reset_input_buffer()
+                self._trace("TX", frame)
+                self.ser.write(frame)
+                time.sleep(0.2)
+                data = self.ser.read(max(self.ser.in_waiting, 24))
+                self._trace("RX", data)
+                for i in range(len(data) - 6):
+                    if data[i + 1] == 0xFF and data[i + 2] == RSP_VERSION:
+                        return (data[i + 3] | (data[i + 4] << 8)
+                                | (data[i + 5] << 16) | (data[i + 6] << 24))
+                time.sleep(0.05)
         return None
 
     # ── writes ────────────────────────────────────────────────────────────────
@@ -1100,15 +1386,26 @@ class SerialBackend(Backend):
 
 class MockBackend(Backend):
     """
-    Drop-in fake. Mirrors the real Quattro this was developed against so the
-    UI looks realistic offline. Telemetry drifts deterministically (no RNG) on
-    each read so the auto-refresh visibly moves. Writes update the in-memory
+    Drop-in fake. Mirrors the real MultiPlus II this was developed against so
+    the UI looks realistic offline. Telemetry drifts deterministically (no RNG)
+    on each read so the auto-refresh visibly moves. Writes update the in-memory
     store and read back correctly.
+
+    Simulates a two-unit system (addresses 0 and 1, like a configured
+    split-phase pair): reads under an absent address return None (silence),
+    address 1 returns distinct AC-side values but the same battery values
+    (shared bank), and the L1 AC frame reports num_phases=1 to bake in the
+    MultiPlus-II 2x120V quirk.
     """
 
-    def __init__(self):
+    PRESENT_ADDRESSES = frozenset({0, 1})
+
+    def __init__(self, address: int = 0):
+        if not 0 <= address <= 0x1F:
+            raise ValueError(f"VE.Bus address must be 0-31, got {address}")
         self.is_mock = True
-        self.description = "MOCK (MultiPlus II)"
+        self.address = address
+        self.description = self._describe()
         self._healthy = True
         self._tick = 0
         # Mirrors the real MultiPlus II this was developed against.
@@ -1131,7 +1428,21 @@ class MockBackend(Backend):
     def close(self) -> None:
         self.connected = False
 
+    def _describe(self) -> str:
+        base = "MOCK (MultiPlus II)"
+        return f"{base}  addr {self.address}" if self.address else base
+
+    def select_address(self, addr: int) -> None:
+        super().select_address(addr)
+        self.description = self._describe()
+
+    @property
+    def _present(self) -> bool:
+        return self.address in self.PRESENT_ADDRESSES
+
     def read_setting(self, setting_id: int) -> Optional[int]:
+        if not self._present:
+            return None
         if setting_id in self.settings:
             return self.settings[setting_id]
         if setting_id in self._unsupported:
@@ -1139,31 +1450,21 @@ class MockBackend(Backend):
         return None  # no such setting
 
     def get_setting_info(self, setting_id: int) -> Optional[bytes]:
-        if setting_id in self.settings:
+        if self._present and setting_id in self.settings:
             return bytes([0x0E, 0xFF, WINMON_SLOT, RSP_GET_INFO, 0x01,
                           0, 0, 0, 0, 0, 0, 0xFE, 0, 0])
         return None
 
     def read_version(self) -> Optional[int]:
-        return 0x0011DB28
-
-    # GetVariableInfo scaling mirrors the real MultiPlus II (see FINDINGS §7.7).
-    _MOCK_INFO = {
-        0: RamVarInfo(False, 0.01, 0), 1: RamVarInfo(True, 0.01, 0),
-        2: RamVarInfo(False, 0.01, 0), 3: RamVarInfo(True, 0.01, 0),
-        4: RamVarInfo(False, 0.01, 0), 5: RamVarInfo(True, 0.1, 0),
-        6: RamVarInfo(False, 0.01, 0), 7: RamVarInfo(False, 0.000512, 256),
-        8: RamVarInfo(False, 0.001024, 0), 9: RamVarInfo(True, 0.01, 0),
-        11: RamVarInfo(bit=4), 12: RamVarInfo(bit=5),
-        13: RamVarInfo(False, 0.005, 0),  # SoC: fractional, normalized to %
-        14: RamVarInfo(True, 1.0, 0), 15: RamVarInfo(True, 1.0, 0),
-        16: RamVarInfo(True, 1.0, 0),
-    }
+        return (0x0011DB28 + self.address) if self._present else None
 
     def read_ramvar_info(self, var_id: int) -> Optional[RamVarInfo]:
-        return self._MOCK_INFO.get(var_id)
+        # Scaling mirrors the real MultiPlus II (see FINDINGS §7.7).
+        return DEFAULT_RAMVAR_INFO.get(var_id) if self._present else None
 
     def read_ramvar(self, var_id: int) -> Optional[int]:
+        if not self._present:
+            return None
         t = self._tick
         self._tick += 1
         drift = (t % 7) - 3  # -3..+3, deterministic
@@ -1185,11 +1486,20 @@ class MockBackend(Backend):
             15: signed_to_u16(0),              # mains power
             16: signed_to_u16(95 + (t % 10)),  # inverter output power
         }
-        if var_id in base:
-            return base[var_id] & 0xFFFF
-        if 0 <= var_id <= 20:
-            return 0
-        return None
+        if var_id not in base:
+            return 0 if 0 <= var_id <= 20 else None
+        raw = base[var_id] & 0xFFFF
+        if self.address:
+            # L2 unit: distinct AC-side values; battery vars (4,5,6,13) and
+            # periods (7,8) stay identical — one shared battery bank.
+            sv = raw - 0x10000 if raw >= 0x8000 else raw
+            if var_id in (0, 2):            # mains/inverter voltage a bit lower
+                raw = (sv - 150) & 0xFFFF
+            elif var_id in (1, 3, 9):       # currents differ
+                raw = (sv + 40) & 0xFFFF
+            elif var_id in (14, 15, 16):    # powers differ
+                raw = (sv - 30) & 0xFFFF
+        return raw
 
     def write_setting(self, setting_id: int, value: int,
                       ram_only: bool = False, verify: bool = True) -> WriteResult:
@@ -1206,14 +1516,48 @@ class MockBackend(Backend):
         return True
 
     def read_config(self) -> Optional[ConfigInfo]:
+        if not self._present:
+            return None
         return ConfigInfo(min_current=9.4, max_current=50.0,
                           actual_current=self._current_limit,
                           switch_register=self._switch_register)
 
     def read_leds(self) -> Optional[LedInfo]:
+        if not self._present:
+            return None
+        if self.address:
+            return LedInfo(on=0x01, blink=0x00)  # L2 unit: Mains only
         # Mains + Bulk lit, like the bench unit; flips inverter on if "off".
         on = 0x01 | 0x04 if (self._switch_register & SW_CHARGE) else 0x10
         return LedInfo(on=on, blink=0x00)
+
+    def read_dc_info(self) -> Optional[DcInfo]:
+        if not self._present:
+            return None
+        return DcInfo(dc_voltage=53.02,
+                      dc_current_to_inverter=1.5 + 0.3 * self.address,
+                      dc_current_from_charger=0.0,
+                      inverter_frequency=60.03)
+
+    def read_ac_info(self, phase: int = 1) -> Optional[AcInfo]:
+        if not 1 <= phase <= 4:
+            raise ValueError(f"AC phase must be 1-4, got {phase}")
+        if not self._present:
+            return None
+        if phase > 2:
+            return None  # simulated pair is split-phase: only L1/L2 exist
+        # Phase-scoped like the real 'F' frames (both phases answer regardless
+        # of the selected address). num_phases=1 on the L1 frame deliberately
+        # mirrors the MultiPlus-II 2x120V quirk — see parse_ac_info.
+        if phase == 1:
+            return AcInfo(phase=1, num_phases=1, device_state=8,   # Bypass
+                          mains_voltage=240.1, mains_current=8.2,
+                          inverter_voltage=240.0, inverter_current=7.9,
+                          mains_frequency=60.01)
+        return AcInfo(phase=2, num_phases=0, device_state=3,       # Slave
+                      mains_voltage=238.6, mains_current=7.6,
+                      inverter_voltage=238.5, inverter_current=7.3,
+                      mains_frequency=60.01)
 
     def set_current_limit(self, amps: float, verify: bool = True) -> WriteResult:
         amps = max(9.4, min(amps, 50.0))
@@ -1232,24 +1576,25 @@ def signed_to_u16(v: int) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def open_backend(port: str = "/dev/ttyUSB0", mock: bool = False,
-                 fallback_to_mock: bool = True) -> Backend:
+                 fallback_to_mock: bool = True, address: int = 0) -> Backend:
     """
     Open a backend. If mock=True, always returns MockBackend. Otherwise tries
     the serial port; on failure, falls back to MockBackend (unless disabled).
+    `address` selects the initial VE.Bus device (0 = master/standalone).
     """
     if mock:
-        b = MockBackend()
+        b = MockBackend(address=address)
         b.open()
         return b
 
     try:
-        b = SerialBackend(port=port)
+        b = SerialBackend(port=port, address=address)
         b.open()
         return b
     except Exception as e:
         if not fallback_to_mock:
             raise
-        m = MockBackend()
+        m = MockBackend(address=address)
         m.open()
         m.description = f"MOCK (fallback — {port}: {e})"
         return m
