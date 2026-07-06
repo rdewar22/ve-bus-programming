@@ -820,10 +820,17 @@ Additional observations from the run:
   Overload bit is the discriminator). NOTE: do not compare two single reads
   taken seconds apart — alternating blink patterns change their instantaneous
   on-mask over time and can fake a per-address difference.
-- **`'F' 0/1/5` are served by the L1 master specifically** (same test): with
-  the master off they all timed out while `'F' 2` (served by the L2 unit) and
-  addr-1 Winmon kept answering. A dead master therefore blinds DC/config/L1
-  data even though the bus is otherwise alive.
+- **Frame serving — proven BOTH directions (2026-07-06).** Master off: `F0/F1/F5`
+  all time out, `F2` + addr-1 Winmon keep answering. Mirror test (L2 unit off,
+  master alive): `F2` times out, `F0/F1/F5` + addr-0 Winmon answer. Conclusion:
+  each phase's AC frame is served by that phase's unit; the DC (`F0`) and
+  config (`F5`) frames by the L1 master. A dead master blinds DC/config/L1
+  data; a dead L2 unit blinds only `F2`.
+- **The MK3 survives its host unit being switched off** — it stays powered
+  from the bus through the daisy-chain cable (mirror test: MK3 plugged into
+  the OFF unit, scan worked fine via the far unit). `num_phases` in the L1
+  frame still reports 2 with the partner dead — it reflects configuration,
+  not live presence.
 - **Front-switched-off unit vanishes from the bus** (confirms §12 assumption);
   its partner reports `device_state Off`, 0 V output, and a multi-LED error
   blink (`Mains,Bulk,Absorption,Float,Inverter`) until the pair re-syncs.
