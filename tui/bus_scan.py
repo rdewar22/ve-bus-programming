@@ -356,6 +356,21 @@ def print_report(snapshots: dict[int, dict], port_desc: str,
               "data is reachable WITHOUT re-addressing; production can simply "
               "request 'F' 2 each poll cycle.")
 
+    # LED scoping verdict — decides whether per-unit LED reads are trustworthy
+    # ('L' could follow the address like Winmon, or ignore it like 'F' frames).
+    if len(addrs) > 1:
+        led_cells = {a: _led_text(snapshots[a]["leds"])[0]
+                     for a in addrs if snapshots[a].get("leds")}
+        if len(led_cells) > 1 and len(set(led_cells.values())) > 1:
+            print("  ★ LED VERDICT: LEDs DIFFER per address — 'L' follows the "
+                  "selected address. Per-unit LED panels are trustworthy; set "
+                  "VEBUS_L2_LEDS=1 in the van's server/.env to enable them.")
+        elif len(led_cells) > 1:
+            print("  LED VERDICT: identical across addresses — INCONCLUSIVE "
+                  "unless the units were in visibly different states during "
+                  "the scan (e.g. one unit in Overload). Re-run while forcing "
+                  "a per-unit condition before trusting addressed LED reads.")
+
 
 def write_csv(path: str, snapshots: dict[int, dict]) -> None:
     rows = build_rows(snapshots)

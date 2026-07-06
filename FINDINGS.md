@@ -807,6 +807,13 @@ Additional observations from the run:
 - The L1 frame reported `num_phases = 2` — **correct** here, contradicting
   the gvos victron_mk3 observation of `1` on a 2x120V unit. Treat the field
   as a hint, `'F' 2` as ground truth (§4.7).
+- **LED scoping — still OPEN.** Whether `'L'` follows the selected address (like
+  Winmon) or ignores it (like `'F'` frames) is unproven: every scan so far had
+  both units in identical LED states. bus_scan now prints an explicit LED
+  VERDICT; to settle it, force a per-unit condition (e.g. overload one leg
+  while inverting) and re-scan `--addresses 0-1`. gvos `inverter.py` has the
+  addressed LED read ready behind `VEBUS_L2_LEDS=1` — enable only on a
+  DIFFER verdict (a master-only LED shown as unit 2's would mislead).
 - Load test (2026-07-06, on shore, space heater on L2): the loaded leg sagged
   ~4 V (115.3–115.8 V vs 119.5 V on L1) and all `device_state` values stayed
   `Charge (9)` — the Slave-while-inverting question remains open (see above).
