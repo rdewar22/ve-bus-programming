@@ -810,6 +810,15 @@ Additional observations from the run:
 - Load test (2026-07-06, on shore, space heater on L2): the loaded leg sagged
   ~4 V (115.3–115.8 V vs 119.5 V on L1) and all `device_state` values stayed
   `Charge (9)` — the Slave-while-inverting question remains open (see above).
+- **Physical identification (load test):** the heater was plugged into the AC
+  out of the unit the MK3-USB is physically attached to, and its load appeared
+  on **L2 / addr 1** — so the MK3-attached unit is the L2 follower and
+  **addr 0 / L1 is the FAR unit**, reached only via the inverter-to-inverter
+  VE.Bus cable. Bus address and phase come from the split-phase system
+  configuration, not from where the MK3 plugs in. Consequently the
+  default-address data that every tool here (and a production poller using
+  `'F' 1` + default Winmon) reads describes the far unit, not the one the MK3
+  is cabled to. Identify units by phase, never by cable position.
 - RAM var 11's upper bits (14/15) vary between runs on both units — they are
   dynamic status bits, not stable per-unit identifiers; do not use them for
   scoping evidence (the load test supersedes the earlier observation).
@@ -820,11 +829,15 @@ Additional observations from the run:
   proves a device is there (exactly how bus_scan's presence probe works).
 - Full 0-31 sweep took 34 s live (absent addresses ≈1 s each incl. resync).
 
-**Production implication (Grounded):** inverter 2's AC status (voltage,
+**Production implication (Grounded):** the second phase's AC status (voltage,
 current, state, frequency) is one `send_ac_request(2)` away from the existing
 gvos `inverter.py` poll loop, from address 0, with no re-addressing. Per-unit
 DC detail (power/current split) would additionally need addressed Winmon
-reads (`select_address(1)` → read vars → restore 0).
+reads (`select_address(1)` → read vars → restore 0). Note the physical
+mapping above: on this bench the existing service's default reads (F1 +
+default-address Winmon) describe the FAR unit, and `send_ac_request(2)`
+returns the MK3-attached unit — label dashboard data by phase (L1/L2), not
+by which unit the MK3 cable touches.
 
 ### Cautions
 
