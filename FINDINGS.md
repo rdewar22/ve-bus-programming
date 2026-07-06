@@ -807,14 +807,19 @@ Additional observations from the run:
 - The L1 frame reported `num_phases = 2` — **correct** here, contradicting
   the gvos victron_mk3 observation of `1` on a 2x120V unit. Treat the field
   as a hint, `'F' 2` as ground truth (§4.7).
-- **LED scoping — SETTLED (2026-07-06): `'L'` does NOT follow the selected
-  address.** Test: L1 master front-switched OFF (panel dark, gone from the
-  bus — its Winmon probe timed out), survivor showing the VE.Bus error blink.
-  Reading LEDs under **address 0 (the dead unit)** still returned data, and it
-  was identical to the addr-1 read (`on=0x1F blink=0x1F`) — the survivor's
-  pattern, not the dark panel. LED state is interface/system-cached; per-unit
-  LED panels are NOT obtainable over one MK3. Do not re-attempt without new
-  evidence on a different firmware.
+- **LED scoping — PARTIALLY settled (2026-07-06).** Ruled out: strict
+  address-scoping à la Winmon. Test: L1 master front-switched OFF (dark
+  panel, gone from the bus — its Winmon probe timed out); reading LEDs under
+  **address 0 (the dead unit)** still returned data identical to the addr-1
+  read (`on=0x1F blink=0x1F`) — the survivor's pattern, not the dark panel.
+  Still OPEN: a fallback model ("addressed unit answers when alive; cache
+  answers when not") that would make per-unit LEDs valid whenever both units
+  run. Deciding test: both units ALIVE with differing LEDs (single-leg
+  overload while inverting), then alternate addr-0/addr-1 LED reads
+  back-to-back and look for bits that appear under ONLY one address (the
+  Overload bit is the discriminator). NOTE: do not compare two single reads
+  taken seconds apart — alternating blink patterns change their instantaneous
+  on-mask over time and can fake a per-address difference.
 - **`'F' 0/1/5` are served by the L1 master specifically** (same test): with
   the master off they all timed out while `'F' 2` (served by the L2 unit) and
   addr-1 Winmon kept answering. A dead master therefore blinds DC/config/L1
