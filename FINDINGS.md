@@ -783,7 +783,7 @@ python3 tui/bus_scan.py --port /dev/inverter -v -o scan.csv
 python3 tui/tui.py --port /dev/inverter --address 1  # watch one unit live
 ```
 
-### Results matrix — measured 2026-07-02
+### Results matrix — measured 2026-07-02, load test 2026-07-06
 
 Bench: two MultiPlus-II configured split-phase 120/240V (L1 + L2), one MK3 on
 the Pi at `/dev/inverter`, system on shore power charging at ~115 A DC /
@@ -798,7 +798,7 @@ the Pi. **The pair enumerates as address 0 (L1 master) and address 1 (L2).**
 | 'F' 1 AC L1 frame | 116.76 V / 29.52 A | 117.31 V / 28.67 A | **Phase-scoped** — answers under both addresses with L1 data (diffs are drift between reads). |
 | 'F' 2 AC L2 frame | 116.92 V / 29.32 A | 117.47 V / 29.32 A | **Phase-scoped, answers under addr 0** → L2 readable with zero re-addressing. Consistent ~0.16 V L1↔L2 gap across snapshots = genuinely two phases. |
 | 'F' 5 config (shore limit) | 50.0 A / On | 50.0 A / On | System-scoped. |
-| Winmon 0x30 RAM vars | ~57 A batt I, 3434 W DC | ~57.6 A, 3462 W | **Per-unit magnitudes** (half the system totals), and address-following all but confirmed: in the second run, addr-0 RAM 2 read 117.31 V = the L1 frame's voltage while addr-1 RAM 2 read 116.37 V = the L2 frame's voltage (exact raw matches, ~1 V apart); RAM 11 raw also differs structurally (0x4004 vs 0x8004). Both units were in near-identical charge state — a run while inverting with imbalanced leg loads would make it airtight. |
+| Winmon 0x30 RAM vars | ~57 A batt I, 3434 W DC | ~57.6 A, 3462 W | **Per-unit, follows the selected address — CONFIRMED by load test.** With a ~1.3 kW space heater on L2 only: addr-0 RAM 9 read −0.29 A (= the F1/L1 value exactly) while addr-1 RAM 9 read 11.64 A (= the F2/L2 value exactly); addr-1 RAM 16 read +1312 W (the heater) vs −56 W idle at addr 0; RAM 1 mains current 31.20 A vs 43.55 A likewise matched F1/F2 per leg. Per-unit RAM 5 charge currents (62.0 + 60.4 A) summed exactly to the F0 system total (122.3–123.0 A). Mapping: **addr 0 = L1 unit, addr 1 = L2 unit.** |
 
 Additional observations from the run:
 - `device_state` read `Charge (9)` on both phase frames (system on shore,
@@ -807,6 +807,12 @@ Additional observations from the run:
 - The L1 frame reported `num_phases = 2` — **correct** here, contradicting
   the gvos victron_mk3 observation of `1` on a 2x120V unit. Treat the field
   as a hint, `'F' 2` as ground truth (§4.7).
+- Load test (2026-07-06, on shore, space heater on L2): the loaded leg sagged
+  ~4 V (115.3–115.8 V vs 119.5 V on L1) and all `device_state` values stayed
+  `Charge (9)` — the Slave-while-inverting question remains open (see above).
+- RAM var 11's upper bits (14/15) vary between runs on both units — they are
+  dynamic status bits, not stable per-unit identifiers; do not use them for
+  scoping evidence (the load test supersedes the earlier observation).
 - RAM var 10 answered with subcmd `0x90` (not `0x85`) and its
   GetVariableInfo scale is 0 → unsupported on this firmware.
 - The MK3 echoes the 'A' address-set frame even for absent addresses — the
