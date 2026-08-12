@@ -1410,8 +1410,8 @@ class MockBackend(Backend):
         self._tick = 0
         # Mirrors the real MultiPlus II this was developed against.
         self.settings: dict[int, int] = {
-            0: 0x8134, 1: 0x45FE, 2: 5680, 3: 5400, 4: 35,
-            9: 1, 10: 1, 11: 4450, 15: 0, 16: 1, 17: 6400, 18: 4700,
+            0: 0x8134, 1: 0x45FE, 2: 5680, 3: 5400, 4: 35, 5: 120, 6: 99,
+            9: 1, 10: 1, 11: 4450, 12: 100, 15: 0, 16: 1, 17: 6400, 18: 4700,
             60: 16, 64: 200, 65: 190, 72: 242, 73: 5200,
             81: 0,  # no grid code
         }
