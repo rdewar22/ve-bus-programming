@@ -24,6 +24,8 @@ https://www.victronenergy.com/upload/documents/Technical-Information-Interfacing
 |--------|---------|
 | `tui/tui.py` | **Interactive terminal dashboard** — live telemetry, decoded flags, charge-profile editing, guarded writes (see below) |
 | `tui/bus_scan.py` | **Read-only VE.Bus address scanner** — enumerates every unit behind one MK3 (parallel / split-phase systems), per-unit telemetry + AC/DC info frames, side-by-side report (see FINDINGS §12) |
+| `tui/verify_ruixu.py` | **Read-only profile check** — compares every setting against the RUiXU 48V LiFePO4 profile, PASS/FAIL per setting (see below) |
+| `tui/apply_ruixu.py` | **Profile writer** — diff-based, writes only deviations in VEConfigure order, readback-verified, then re-runs the verify suite (see below) |
 | `tui/vebus/protocol.py` | Reusable backend: serial/checksum/frame protocol, `SerialBackend`, `MockBackend`, and all decoders. Importable by scripts and tests |
 | `setv.py` | Set absorption and float voltage (WriteViaID example) |
 | `settings_sweep.py` | Sweep all 256 setting IDs — dump supported settings to CSV for diffing |
@@ -103,7 +105,35 @@ model, and the port (plus an `[ADDR n]` chip when watching a non-master unit).
 
 ```bash
 python3 tui/test_protocol.py    # unit tests, no hardware required
+python3 tui/test_verify.py      # verify_ruixu checks
+python3 tui/test_apply.py       # apply_ruixu plan/write/idempotency
 ```
+
+## Profile Verify & Apply (`tui/verify_ruixu.py`, `tui/apply_ruixu.py`)
+
+Provisioning tools for the RUiXU 48V LiFePO4 profile (30A AC limit, 56.00/54.60V
+charge voltages, 44.00V shutdown +1.00V restart, PowerAssist, dynamic current
+limiter, wide frequency range, fixed charge curve):
+
+```bash
+# Check compliance — strictly read-only, both default ports:
+python3 tui/verify_ruixu.py                  # /dev/inverter + /dev/inverter2
+python3 tui/verify_ruixu.py --mock           # demo without hardware
+
+# Bring a unit into compliance — writes ONLY the settings that deviate
+# (minimal EEPROM wear), flag registers via read-modify-write, every write
+# readback-verified, full verify report afterwards:
+python3 tui/apply_ruixu.py --dry-run         # show the plan, write nothing
+python3 tui/apply_ruixu.py                   # interactive confirm per port
+python3 tui/apply_ruixu.py --yes /dev/inverter2
+```
+
+Three things stay VEConfigure-only (no known setting ID): the 50/60 Hz output
+frequency (verified live only — a 50 Hz unit can't be fixed here), the
+"current limit overruled by remote" checkbox, and per-unit charger disable for
+240V systems. Stop whatever holds the port first (`sudo systemctl stop
+grounded-inverter grounded-inverter2`), restart it after. Exit codes are
+scriptable: 0 compliant, 1 deviations/failed writes, 2 port/link problem.
 
 ## Multi-Unit Scanning (`tui/bus_scan.py`)
 
