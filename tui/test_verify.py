@@ -131,6 +131,29 @@ class TestDeviations(unittest.TestCase):
         self.assertEqual(r.status, "MANUAL")
 
 
+class TestRviaShoreLimit(unittest.TestCase):
+    """RVIA vans (20A breaker) run a 16A shore limit."""
+
+    def test_30a_unit_fails_a_16a_check(self):
+        results = v.run_checks(compliant_mock(), shore_limit=16.0)
+        self.assertEqual(by_name(results, "AC input current limit 16A").status, "FAIL")
+        self.assertEqual(by_name(results, "Runtime shore limit 16A ('F' 5)").status, "WARN")
+
+    def test_16a_unit_passes(self):
+        b = compliant_mock()
+        b.settings[6] = 160
+        b._current_limit = 16.0
+        results = v.run_checks(b, shore_limit=16.0)
+        self.assertEqual([r for r in results if r.status == "FAIL"], [])
+        self.assertEqual(by_name(results, "Runtime shore limit 16A ('F' 5)").status, "PASS")
+
+    def test_shore_limit_arg_range(self):
+        self.assertEqual(v.shore_limit_arg("16"), 16.0)
+        for bad in ("5", "60", "abc"):
+            with self.assertRaises(v.argparse.ArgumentTypeError):
+                v.shore_limit_arg(bad)
+
+
 class TestSilentUnit(unittest.TestCase):
     def test_dead_bus_detected(self):
         b = p.MockBackend(address=5)  # absent address → every read is None

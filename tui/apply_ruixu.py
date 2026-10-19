@@ -17,11 +17,11 @@ Target profile (see verify_ruixu.py for the raw values):
                                  56.00V absorption / 54.60V float / 1
     Setting 1   wide input frequency range ON (bit 11),
                 dynamic current limiter ON (bit 12)
-    Setting 6   AC1 input current limit 30.0 A
+    Setting 6   AC1 input current limit 30.0 A (--shore-limit; 16 on RVIA vans)
     Setting 11  DC input low shutdown 44.00 V
     Setting 12  restart offset +1.00 V
-    plus the runtime shore limit ('S' long form) is moved to 30 A if a remote
-    panel/app had it elsewhere.
+    plus the runtime shore limit ('S' long form) is moved to the same value if
+    a remote panel/app had it elsewhere.
 
 NOT settable here (VEConfigure only — no known setting ID):
     * 50/60 Hz output frequency (verified live only; a 50 Hz unit needs VEConfigure)
@@ -32,6 +32,8 @@ NOT settable here (VEConfigure only — no known setting ID):
     python3 tui/apply_ruixu.py --dry-run           # show the plan, write nothing
     python3 tui/apply_ruixu.py                     # prompts before writing
     python3 tui/apply_ruixu.py --yes /dev/inverter2
+    python3 tui/apply_ruixu.py --shore-limit 16    # RVIA van (20A breaker)
+    python3 tui/apply_ruixu.py --shore-limit 16 --shore-limit-only   # setting 6 only
 
 Exit code: 0 compliant (nothing to do, or applied and verified), 1 a write
 failed or FAILs remain after applying, 2 could not open/talk to a port,
@@ -68,14 +70,16 @@ OTHER_TARGETS = [(6, 300), (11, 4400), (12, 100)]
 
 PLAN_SIDS = [0, 1] + [sid for sid, _ in CHARGE_TARGETS + OTHER_TARGETS]
 
-SHORE_LIMIT_A = 30.0
+SHORE_LIMIT_A = v.DEFAULT_SHORE_LIMIT_A
 
 
 def read_current(backend: p.Backend) -> dict[int, Optional[int]]:
     return {sid: backend.read_setting(sid) for sid in PLAN_SIDS}
 
 
-def build_plan(vals: dict[int, Optional[int]]
+def build_plan(vals: dict[int, Optional[int]],
+               shore_limit: float = SHORE_LIMIT_A,
+               shore_only: bool = False
                ) -> tuple[list[p.WriteStep], list[str]]:
     """Ordered write steps for every deviation, plus notes for skips."""
     steps: list[p.WriteStep] = []
@@ -110,12 +114,15 @@ def build_plan(vals: dict[int, Optional[int]]
                 f"{p.setting_meta(sid).name} → {p.format_setting_value(sid, want)}",
                 note=f"currently {p.format_setting_value(sid, val)}"))
 
+    if shore_only:
+        value(6, round(shore_limit * 10))
+        return steps, notes
     rmw(*FLAG_TARGETS[0])
     for sid, want in CHARGE_TARGETS:
         value(sid, want)
     rmw(*FLAG_TARGETS[1])
     for sid, want in OTHER_TARGETS:
-        value(sid, want)
+        value(sid, round(shore_limit * 10) if sid == 6 else want)
     return steps, notes
 
 
@@ -163,6 +170,12 @@ def ensure_shore_limit(backend: p.Backend,
     return "fail", res.message
 
 
+def shore_results(results: list[v.CheckResult]) -> list[v.CheckResult]:
+    """Only the shore-limit rows: the charge profile is not this run's business."""
+    return [r for r in results if r.name.startswith(
+        ("AC input current limit", "Current limit overruled", "Runtime shore limit"))]
+
+
 def print_plan(port: str, steps: list[p.WriteStep], notes: list[str]) -> None:
     if steps:
         print(f"\n== {port} — {len(steps)} write(s) needed:")
@@ -192,7 +205,7 @@ def process_port(port: str, backend: p.Backend, args) -> int:
               " Is it switched ON and is this the right port?")
         return 2
 
-    steps, notes = build_plan(vals)
+    steps, notes = build_plan(vals, args.shore_limit, args.shore_limit_only)
     print_plan(port, steps, notes)
 
     problems = validate_plan(steps)
@@ -203,9 +216,9 @@ def process_port(port: str, backend: p.Backend, args) -> int:
 
     if args.dry_run:
         cfg = backend.read_config()
-        if cfg is not None and abs(cfg.actual_current - SHORE_LIMIT_A) >= 0.05:
+        if cfg is not None and abs(cfg.actual_current - args.shore_limit) >= 0.05:
             print(f"  would also move the runtime shore limit"
-                  f" {cfg.actual_current:.1f} → {SHORE_LIMIT_A:.1f} A")
+                  f" {cfg.actual_current:.1f} → {args.shore_limit:.1f} A")
         return 0
 
     if steps:
@@ -215,10 +228,13 @@ def process_port(port: str, backend: p.Backend, args) -> int:
         if not apply_steps(backend, steps):
             return 1
 
-    status, msg = ensure_shore_limit(backend)
+    status, msg = ensure_shore_limit(backend, args.shore_limit)
     print(f"  shore limit: {msg}")
 
-    results = v.run_checks(backend, charger_disabled=args.charger_disabled)
+    results = v.run_checks(backend, charger_disabled=args.charger_disabled,
+                           shore_limit=args.shore_limit)
+    if args.shore_limit_only:
+        results = shore_results(results)
     v.print_report(port, backend, results)
     ident = backend.identify()
     if ident.model == "Quattro":
@@ -249,6 +265,14 @@ def main() -> int:
     ap.add_argument("--charger-disabled", action="store_true",
                     help="include the manual charger-disable reminder in the"
                          " final report (240V single-120V unit)")
+    ap.add_argument("--shore-limit", type=v.shore_limit_arg,
+                    default=SHORE_LIMIT_A, metavar="A",
+                    help="AC input current limit to store (setting 6) and set"
+                         f" live, in amps (default {SHORE_LIMIT_A:g}; 16 on"
+                         " RVIA vans with a 20A breaker)")
+    ap.add_argument("--shore-limit-only", action="store_true",
+                    help="write only setting 6 and the live limit; leave the"
+                         " charge profile alone (non-RUiXU batteries)")
     args = ap.parse_args()
 
     if args.mock:

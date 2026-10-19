@@ -127,6 +127,36 @@ class TestShoreLimit(unittest.TestCase):
         self.assertEqual(b.read_config().actual_current, 30.0)
         self.assertIn("12.0", msg)
 
+    def test_rvia_16a_moves_runtime_limit(self):
+        b = factory_mock()
+        status, _ = a.ensure_shore_limit(b, 16.0)
+        self.assertEqual(status, "fixed")
+        self.assertEqual(b.read_config().actual_current, 16.0)
+
+    def test_rvia_16a_plan_apply_verify(self):
+        b = factory_mock()
+        steps, _ = a.build_plan(a.read_current(b), 16.0)
+        self.assertIn((6, 160), [(s.setting_id, s.value) for s in steps])
+        self.assertEqual(a.validate_plan(steps), [])
+        self.assertTrue(a.apply_steps(b, steps, out=lambda s: None))
+        a.ensure_shore_limit(b, 16.0)
+        results = v.run_checks(b, shore_limit=16.0)
+        self.assertEqual([r for r in results if r.status == "FAIL"], [])
+        self.assertEqual(a.build_plan(a.read_current(b), 16.0), ([], []))
+
+    def test_shore_limit_only_touches_setting_6(self):
+        b = factory_mock()
+        steps, notes = a.build_plan(a.read_current(b), 16.0, shore_only=True)
+        self.assertEqual([(s.setting_id, s.value) for s in steps], [(6, 160)])
+        self.assertEqual(notes, [])
+        self.assertTrue(a.apply_steps(b, steps, out=lambda s: None))
+        a.ensure_shore_limit(b, 16.0)
+        rows = a.shore_results(v.run_checks(b, shore_limit=16.0))
+        self.assertEqual({r.name: r.status for r in rows if r.status != "MANUAL"},
+                         {"AC input current limit 16A": "PASS",
+                          "Runtime shore limit 16A ('F' 5)": "PASS"})
+        self.assertEqual(b.settings[2], 5680)  # charge profile untouched
+
     def test_dead_config_frame_skips(self):
         b = p.MockBackend(address=5)  # absent address → no config response
         b.open()
