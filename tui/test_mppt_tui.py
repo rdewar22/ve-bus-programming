@@ -37,6 +37,25 @@ async def confirm(app, pilot):
     await settle(app, pilot)
 
 
+def record_notes(app) -> list:
+    notes = []
+    app.notify = lambda msg, **kw: notes.append(
+        (msg, kw.get("severity", "information")))
+    return notes
+
+
+def count_calls(backend, *names) -> dict:
+    counts = dict.fromkeys(names, 0)
+    for name in names:
+        real = getattr(backend, name)
+
+        def wrapped(*a, _real=real, _name=name):
+            counts[_name] += 1
+            return _real(*a)
+        setattr(backend, name, wrapped)
+    return counts
+
+
 class TestMPPTTUI(unittest.IsolatedAsyncioTestCase):
     def make(self, **kw):
         self.backend = vd.MockVEDirect(**kw)
@@ -149,6 +168,89 @@ class TestMPPTTUI(unittest.IsolatedAsyncioTestCase):
             out = str(app.query_one("#probe-result", Static).render())
             self.assertIn("80 16", out)        # 5760 little-endian
             self.assertIn("57.60V", out)
+
+
+    async def test_silent_controller_reads_no_registers(self):
+        app = self.make()
+        self.backend.silent = True
+        calls = count_calls(self.backend, "get", "ping")
+        async with app.run_test(size=(150, 60)) as pilot:
+            await settle(app, pilot)
+            self.assertEqual(calls["get"], 0)   # bailed after the ping
+            self.assertEqual(calls["ping"], 1)
+            self.assertEqual(app.query_one("#raw-table", DataTable).row_count, 0)
+
+    async def test_dead_link_costs_one_ping_per_telemetry_tick(self):
+        app = self.make()
+        async with app.run_test(size=(150, 60)) as pilot:
+            await settle(app, pilot)
+            self.backend.silent = True
+            calls = count_calls(self.backend, "get", "ping")
+            app.refresh_telemetry()
+            await settle(app, pilot)
+            self.assertEqual(calls, {"get": 1, "ping": 1})
+            app.refresh_telemetry()           # link known dead: ping only
+            await settle(app, pilot)
+            self.assertEqual(calls, {"get": 1, "ping": 2})
+
+    async def test_one_silent_register_keeps_the_snapshot(self):
+        app = self.make()
+        last = list(vd.REG_META)[-1]
+        real_get = self.backend.get
+
+        def get(reg):
+            if reg == last:
+                self.backend.healthy = False
+                return None, vd.NO_RESPONSE
+            return real_get(reg)
+        self.backend.get = get
+        async with app.run_test(size=(150, 60)) as pilot:
+            await settle(app, pilot)
+            self.assertEqual(app.query_one("#raw-table", DataTable).row_count,
+                             len(vd.REG_META))
+            self.assertGreater(app.query_one("#batt-table", DataTable).row_count, 10)
+            self.assertTrue(self.backend.healthy)  # the ping restored it
+
+    async def test_charger_on_old_firmware_not_reported_failed(self):
+        app = self.make()
+        self.backend.fw_word = 0x4116  # v1.16: 0x0200 reads operating state
+        real_get = self.backend.get
+        self.backend.get = lambda reg: ((0, "") if reg == vd.REG_DEVICE_MODE
+                                        else real_get(reg))  # night: not charging
+        notes = record_notes(app)
+        async with app.run_test(size=(150, 60)) as pilot:
+            await settle(app, pilot)
+            await press(app, pilot, "#mode-on")
+            await confirm(app, pilot)
+            self.assertEqual(self.backend.regs[vd.REG_DEVICE_MODE],
+                             vd.DEVICE_MODE_ON)
+            self.assertFalse([n for n in notes if n[1] == "error"], notes)
+
+    async def test_system_voltage_written_via_edef(self):
+        app = self.make()
+        self.backend.readonly.add(vd.REG_BATTERY_VOLTAGE_SETTING)  # fw 1.12-1.16
+        notes = record_notes(app)
+        async with app.run_test(size=(150, 60)) as pilot:
+            await settle(app, pilot)
+            app.query_one("#sel-sysv", Select).value = 48
+            await press(app, pilot, "#set-sysv")
+            await confirm(app, pilot)
+            self.assertEqual(
+                self.backend.regs[vd.REG_BATTERY_VOLTAGE_SETTING], 48)
+            self.assertFalse([n for n in notes if n[1] == "error"], notes)
+
+    async def test_auto_detect_on_firmware_without_edea(self):
+        app = self.make()
+        self.backend.unsupported.add(vd.REG_BATTERY_VOLTAGE_SETTING)  # < 1.12
+        self.backend.regs[vd.REG_BATTERY_VOLTAGE] = 24
+        notes = record_notes(app)
+        async with app.run_test(size=(150, 60)) as pilot:
+            await settle(app, pilot)
+            app.query_one("#sel-sysv", Select).value = 0
+            await press(app, pilot, "#set-sysv")
+            await confirm(app, pilot)
+            self.assertFalse([n for n in notes if n[1] == "error"], notes)
+            self.assertTrue(any("written ✓" in n[0] for n in notes), notes)
 
 
 if __name__ == "__main__":

@@ -44,20 +44,23 @@ class ConfirmWrite(ModalScreen[bool]):
     """Confirm a single register write (always NVM on VE.Direct)."""
 
     def __init__(self, reg: int, old: Optional[int], new: int,
-                 warning: str = ""):
+                 warning: str = "", write_reg: Optional[int] = None):
         super().__init__()
         self.reg = reg
         self.old = old
         self.new = new
         self.warning = warning
+        self.write_reg = write_reg
 
     def compose(self) -> ComposeResult:
         m = vd.REG_META[self.reg]
         old_raw = "—" if self.old is None else f"0x{self.old:X}"
+        via = (f" (written via 0x{self.write_reg:04X})"
+               if self.write_reg not in (None, self.reg) else "")
         with Vertical(id="dialog"):
             yield Label("⚠  Confirm write", id="dialog-title")
             yield Static(
-                f"[b]Register 0x{self.reg:04X}[/b] — {m.name}\n\n"
+                f"[b]Register 0x{self.reg:04X}[/b]{via} — {m.name}\n\n"
                 f"  raw:      {old_raw} → [b]0x{self.new:X}[/b]\n"
                 f"  decoded:  {vd.format_reg_value(self.reg, self.old)} → "
                 f"[b]{vd.format_reg_value(self.reg, self.new)}[/b]",
@@ -93,7 +96,7 @@ class ConfirmSequence(ModalScreen[bool]):
             table = DataTable(id="seq-table", zebra_stripes=True)
             table.add_columns("#", "Register", "New raw", "Change")
             for i, s in enumerate(self.steps, 1):
-                table.add_row(str(i), f"0x{s.reg:04X}", str(s.value), s.label)
+                table.add_row(str(i), f"0x{s.write_reg:04X}", str(s.value), s.label)
             yield table
             for n in self.notes:
                 yield Static(f"[yellow]note: {n}[/yellow]")
@@ -222,6 +225,7 @@ class MPPTTUI(App):
         self.vals: dict[int, Optional[int]] = {}
         self.errs: dict[int, str] = {}
         self.info: dict[str, str] = {}
+        self.fw_word: Optional[int] = None
         self._tele_busy = False
         self._tele_started = False
 
@@ -347,18 +351,34 @@ class MPPTTUI(App):
             return
         self._tele_busy = True
         try:
-            for reg in TELEMETRY:
-                if reg in self.errs:
-                    continue  # model doesn't have it (learned on full read)
-                val, _ = self.backend.get(reg)
-                if val is not None:
-                    self.vals[reg] = val
-            mode, _ = self.backend.get(vd.REG_DEVICE_MODE)
-            if mode is not None:
-                self.vals[vd.REG_DEVICE_MODE] = mode
-            self.call_from_thread(self._fill_telemetry)
+            if not self.backend.healthy and self.backend.ping() is None:
+                self.call_from_thread(self.update_status)
+                return  # still dead: one ping per tick, not a timeout per register
+            # Skip registers the model rejected on the full read (flag errors).
+            regs = [r for r in TELEMETRY + [vd.REG_DEVICE_MODE]
+                    if self.errs.get(r, vd.NO_RESPONSE) == vd.NO_RESPONSE]
+            fresh, _, _ = self._read_regs(regs)
+            self.call_from_thread(self._merge_telemetry, fresh)
         finally:
             self._tele_busy = False
+
+    def _read_regs(self, regs) -> tuple[dict, dict, bool]:
+        """Read `regs` (worker thread). On a silent register, ping once to tell
+        a dead link (stop; alive=False) from one register that won't answer."""
+        vals, errs = {}, {}
+        for reg in regs:
+            val, err = self.backend.get(reg)
+            if val is not None:
+                vals[reg] = val
+                continue
+            errs[reg] = err
+            if err == vd.NO_RESPONSE and self.backend.ping() is None:
+                return vals, errs, False
+        return vals, errs, True
+
+    def _merge_telemetry(self, fresh: dict) -> None:
+        self.vals.update(fresh)  # UI thread only — writes validate against vals
+        self._fill_telemetry()
 
     def _row(self, reg: int) -> tuple[str, str, str, str]:
         v = self.vals.get(reg)
@@ -391,30 +411,30 @@ class MPPTTUI(App):
     @work(thread=True, exclusive=True, group="settings")
     def refresh_all_worker(self) -> None:
         b = self.backend
+        ping = b.ping()
+        if ping is None:  # silent link: keep the last snapshot on screen
+            self.call_from_thread(self.update_status)
+            return
+        self.fw_word = ping
         if not self.info:
-            ping = b.ping()
             pid = b.product_id()
             model, _ = b.get_string(vd.REG_MODEL_NAME)
             serial, _ = b.get_string(vd.REG_SERIAL)
-            if ping is not None:
-                self.info = {
-                    "fw": f"fw {vd.format_version(ping)}",
-                    "model": model or (f"product 0x{pid:04X}" if pid else "?"),
-                    "serial": serial or "—",
-                }
-        vals, errs = {}, {}
-        for reg in vd.REG_META:
-            val, err = b.get(reg)
-            if val is None:
-                errs[reg] = err
-            else:
-                vals[reg] = val
-        if not b.healthy:  # silent link: keep the last snapshot on screen
+            self.info = {
+                "fw": f"fw {vd.format_version(ping)}",
+                "model": model or (f"product 0x{pid:04X}" if pid else "?"),
+                "serial": serial or "—",
+            }
+        vals, errs, alive = self._read_regs(vd.REG_META)
+        if not alive:
             self.call_from_thread(self.update_status)
             return
+        self.call_from_thread(self._apply_snapshot, vals, errs)
+
+    def _apply_snapshot(self, vals: dict, errs: dict) -> None:
         self.vals, self.errs = vals, errs
-        self.call_from_thread(self._fill_panels)
-        self.call_from_thread(self._start_telemetry)
+        self._fill_panels()
+        self._start_telemetry()
 
     def _start_telemetry(self) -> None:
         if self._tele_started:
@@ -491,26 +511,33 @@ class MPPTTUI(App):
 
     # ── writes ────────────────────────────────────────────────────────────────
 
-    async def _confirm_and_write(self, reg: int, new: int,
-                                 warning: str = "") -> bool:
-        """Validate, confirm, write, readback-verify. Returns ok."""
+    async def _confirm_and_write(self, reg: int, new: int, warning: str = "",
+                                 write_reg: Optional[int] = None,
+                                 accept=None) -> bool:
+        """Validate, confirm, write (to `write_reg` if given), read back `reg`
+        and check it (== new, or `accept(readback)`). Returns ok."""
         vr = vd.validate_write(reg, new, self.vals)
         if not vr.ok:
             self.notify(vr.message, severity="error", timeout=8)
             return False
-        if not await self.push_screen_wait(
-                ConfirmWrite(reg, self.vals.get(reg), new, warning)):
+        if not await self.push_screen_wait(ConfirmWrite(
+                reg, self.vals.get(reg), new, warning, write_reg)):
             self.notify("Write cancelled.", severity="information")
             return False
-        ok, err = await asyncio.to_thread(self.backend.set, reg, new)
+        ok, err = await asyncio.to_thread(self.backend.set, write_reg or reg, new)
+        readback = None
         if ok:
             readback, rerr = await asyncio.to_thread(self.backend.get, reg)
-            ok = readback == new
+            ok = readback is not None and (
+                accept(readback) if accept else readback == new)
             err = "" if ok else f"readback got {readback} {rerr}".strip()
             if readback is not None:
                 self.vals[reg] = readback
         name = vd.REG_META[reg].name
-        if ok:
+        if ok and accept:
+            self.notify(f"{name} written ✓ readback now "
+                        f"{vd.format_reg_value(reg, readback)}", timeout=6)
+        elif ok:
             self.notify(f"{name} = {vd.format_reg_value(reg, new)} ✓ readback "
                         "confirmed", timeout=6)
         else:
@@ -544,14 +571,19 @@ class MPPTTUI(App):
         if not isinstance(value, int):
             self.notify("Pick a system voltage.", severity="error")
             return
-        # 0xEDEA reports auto vs fixed and is writable from fw 1.17; older
-        # firmware only takes the setting through 0xEDEF.
-        reg = (vd.REG_BATTERY_VOLTAGE_SETTING
-               if vd.REG_BATTERY_VOLTAGE_SETTING in self.vals
+        # Written via 0xEDEF (every firmware); verified on 0xEDEA, which shows
+        # auto vs fixed but is only writable from fw 1.17 (readable from 1.12).
+        has_setting = vd.REG_BATTERY_VOLTAGE_SETTING in self.vals
+        reg = (vd.REG_BATTERY_VOLTAGE_SETTING if has_setting
                else vd.REG_BATTERY_VOLTAGE)
+        accept = None
+        if not has_setting and value == 0:
+            # 0xEDEF reads the operating voltage, so auto can't be read back.
+            accept = lambda rb: rb in vd.SYSTEM_VOLTAGES  # noqa: E731
         await self._confirm_and_write(
             reg, value, warning="Changing the system voltage resets the "
-            "voltage-dependent limits — re-check every charge voltage after.")
+            "voltage-dependent limits — re-check every charge voltage after.",
+            write_reg=vd.REG_BATTERY_VOLTAGE, accept=accept)
 
     @on(Button.Pressed, "#type-user")
     @work
@@ -614,7 +646,11 @@ class MPPTTUI(App):
         ok, err = await asyncio.to_thread(b.set, vd.REG_DEVICE_MODE, mode)
         readback, _ = await asyncio.to_thread(b.get, vd.REG_DEVICE_MODE)
         on_now = readback == vd.DEVICE_MODE_ON
-        if ok and readback is not None and on_now == (mode == vd.DEVICE_MODE_ON):
+        if ok and vd.version_number(self.fw_word or 0) < 0x117:
+            # fw <= 1.16 reads back whether it is charging, not the switch.
+            self.notify(f"Charger {name} accepted ✓ (this firmware can't read "
+                        "the switch back — watch the charge state)", timeout=8)
+        elif ok and readback is not None and on_now == (mode == vd.DEVICE_MODE_ON):
             self.vals[vd.REG_DEVICE_MODE] = readback
             self.notify(f"Charger switched {name} ✓ readback confirmed", timeout=6)
         else:

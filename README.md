@@ -162,7 +162,8 @@ from Victron's [VE.Direct HEX protocol doc for BlueSolar/SmartSolar MPPTs](https
 loudly instead of writing silently wrong values. The system-voltage check reads
 `0xEDEA` (the *setting*, 0 = auto-detect), not `0xEDEF` — `0xEDEF` always
 reports the operating voltage, so an auto-detecting unit that found 48V would
-otherwise pass.
+otherwise pass. Writes go the other way, through `0xEDEF`: `0xEDEA` is only
+writable from firmware 1.17, while `0xEDEF` takes writes on every firmware.
 
 ## Solar Charger TUI (`tui/mppt_tui.py`)
 
@@ -204,7 +205,12 @@ Safety differences from the VE.Bus TUI:
   defined (they don't stick otherwise; an out-of-range set raises error 119,
   which needs a factory reset + power cycle to clear).
 - **Readback-verified**, and a battery-type or system-voltage change reloads
-  everything (both move other values).
+  everything (both move other values). On firmware ≤ 1.16 the on/off register
+  reads back whether the unit is charging, not the switch, so Charger ON/OFF
+  there only confirms the write was accepted.
+- **A silent controller doesn't freeze the UI** — every refresh pings first,
+  and a dead link costs one ping per telemetry tick rather than a timeout per
+  register.
 
 Not exposed on purpose: restore factory defaults (`0x0004`), history clear,
 relay settings, and the lighting-controller timer.

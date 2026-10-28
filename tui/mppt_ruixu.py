@@ -54,6 +54,10 @@ TARGETS = [
     (vd.REG_FLOAT_VOLTAGE, 5500),
 ]
 
+# Verified on one register, written through another: 0xEDEA shows auto vs
+# fixed but is only writable from fw 1.17; 0xEDEF takes writes on every fw.
+WRITE_VIA = {vd.REG_BATTERY_VOLTAGE_SETTING: vd.REG_BATTERY_VOLTAGE}
+
 
 @dataclass
 class CheckResult:
@@ -64,9 +68,10 @@ class CheckResult:
 
 @dataclass
 class PlanStep:
-    reg: int
+    reg: int          # register verified (and read back)
     value: int
     label: str
+    write_reg: int    # register written — differs only for WRITE_VIA
 
 
 def read_current(backend) -> dict[int, tuple[Optional[int], str]]:
@@ -105,19 +110,20 @@ def build_plan(vals) -> tuple[list[PlanStep], list[str]]:
             steps.append(PlanStep(
                 reg, want,
                 f"{meta.name}: {vd.format_reg_value(reg, val)}"
-                f" → {vd.format_reg_value(reg, want)}"))
+                f" → {vd.format_reg_value(reg, want)}",
+                WRITE_VIA.get(reg, reg)))
     return steps, notes
 
 
 def apply_steps(backend, steps: list[PlanStep], out=print) -> bool:
     for i, s in enumerate(steps, 1):
-        ok, err = backend.set(s.reg, s.value)
+        ok, err = backend.set(s.write_reg, s.value)
         if ok:
             readback, rerr = backend.get(s.reg)
             ok = readback == s.value
             err = f"readback got {readback} ({rerr})" if not ok else ""
         msg = "ok      readback confirmed" if ok else f"FAILED  {err}"
-        out(f"  [{i}/{len(steps)}] 0x{s.reg:04X} = {s.value:<5} {msg} — {s.label}")
+        out(f"  [{i}/{len(steps)}] 0x{s.write_reg:04X} = {s.value:<5} {msg} — {s.label}")
         if not ok:
             out("  Aborting remaining writes — already-written registers are"
                 " fine to rewrite on a re-run.")
@@ -160,7 +166,7 @@ def process(port: str, backend, args) -> int:
     if steps:
         print(f"\n== {port} — {len(steps)} write(s) needed:")
         for s in steps:
-            print(f"  0x{s.reg:04X} = {s.value:<5} {s.label}")
+            print(f"  0x{s.write_reg:04X} = {s.value:<5} {s.label}")
     else:
         print(f"\n== {port} — all registers already match the profile.")
     for n in notes:

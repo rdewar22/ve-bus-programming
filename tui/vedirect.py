@@ -49,6 +49,8 @@ RSP_DONE = 0x1
 RSP_PING = 0x5
 CMD_ASYNC = 0xA          # unsolicited broadcasts — always skipped
 
+NO_RESPONSE = "no response"  # error string for a silent link (vs flag errors)
+
 # Get/Set response flags byte.
 FLAG_ERRORS = {
     0x01: "unknown register id",
@@ -313,12 +315,18 @@ def format_reg_value(reg: int, value: Optional[int]) -> str:
     return f"{value}{m.unit}"
 
 
+def version_number(word: int) -> int:
+    """Ping word → comparable version (0x4116 → 0x116). The top nibble holds
+    the firmware type (and release-candidate bits), not the version."""
+    return word & 0x0FFF
+
+
 def format_version(word: Optional[int]) -> str:
-    """Ping word → 'v1.16'. The top two bits are the firmware type, not part
-    of the version (0x4116 = application v1.16)."""
+    """Ping word → 'v1.16' (0x4116 = application v1.16)."""
     if word is None:
         return "—"
-    return f"v{(word >> 8) & 0x0F:X}.{word & 0xFF:02X}"
+    v = version_number(word)
+    return f"v{v >> 8:X}.{v & 0xFF:02X}"
 
 
 # ── write validation ─────────────────────────────────────────────────────────
@@ -539,7 +547,7 @@ class SerialVEDirect:
         """(value, error). value None ⇒ error says why (silence or flags)."""
         payload = self._transact(build_get(reg), CMD_GET, reg)
         if payload is None:
-            return None, "no response"
+            return None, NO_RESPONSE
         flags, value = decode_reply(payload, reg)
         if flags:
             return None, FLAG_ERRORS.get(flags, f"error flags 0x{flags:02X}")
@@ -548,7 +556,7 @@ class SerialVEDirect:
     def get_string(self, reg: int) -> tuple[Optional[str], str]:
         payload = self._transact(build_get(reg), CMD_GET, reg)
         if payload is None:
-            return None, "no response"
+            return None, NO_RESPONSE
         if payload[2]:
             return None, FLAG_ERRORS.get(payload[2], f"error flags 0x{payload[2]:02X}")
         return decode_string(payload), ""
@@ -557,7 +565,7 @@ class SerialVEDirect:
         """Raw value bytes of any register — for probing unknown ids."""
         payload = self._transact(build_get(reg), CMD_GET, reg)
         if payload is None:
-            return None, "no response"
+            return None, NO_RESPONSE
         if payload[2]:
             return None, FLAG_ERRORS.get(payload[2], f"error flags 0x{payload[2]:02X}")
         return payload[3:], ""
@@ -580,13 +588,18 @@ class MockVEDirect:
     """Simulated SmartSolar 150/45 with load-less, factory-ish 48V defaults
     (deviating from the RUiXU solar profile so demos/tests show real work).
     Like the real charger, it rejects charge-voltage writes unless the
-    battery type is user defined."""
+    battery type is user defined. Tests can set `silent` (no replies at all),
+    `readonly` (registers that answer 'not supported' to writes) and
+    `fw_word` (the ping reply)."""
 
     PRODUCT_ID = 0xA061
 
     def __init__(self, load_output: bool = False):
         self.is_mock = True
         self.healthy = True
+        self.silent = False
+        self.readonly: set[int] = set()
+        self.fw_word = 0x4165  # application firmware v1.65
         self.description = "MOCK (SmartSolar)"
         self.regs: dict[int, int] = {
             # history, adaptive, equalise, remote, panel I, BMS, ext ctl, sync
@@ -642,13 +655,19 @@ class MockVEDirect:
     def open(self) -> None: ...
     def close(self) -> None: ...
 
+    def _answers(self) -> bool:
+        self.healthy = not self.silent
+        return self.healthy
+
     def ping(self) -> Optional[int]:
-        return 0x4165  # application firmware v1.65
+        return self.fw_word if self._answers() else None
 
     def product_id(self) -> Optional[int]:
-        return self.PRODUCT_ID
+        return self.PRODUCT_ID if self._answers() else None
 
     def get(self, reg: int) -> tuple[Optional[int], str]:
+        if not self._answers():
+            return None, NO_RESPONSE
         if reg in self.unsupported:
             return None, FLAG_ERRORS[0x02]
         if reg not in self.regs:
@@ -659,6 +678,8 @@ class MockVEDirect:
         return self.regs[reg], ""
 
     def get_string(self, reg: int) -> tuple[Optional[str], str]:
+        if not self._answers():
+            return None, NO_RESPONSE
         if reg in self.strings:
             return self.strings[reg], ""
         return None, FLAG_ERRORS[0x01]
@@ -673,7 +694,9 @@ class MockVEDirect:
         return val.to_bytes(size, "little"), ""
 
     def set(self, reg: int, value: int) -> tuple[bool, str]:
-        if reg in self.unsupported:
+        if not self._answers():
+            return False, "no response to set"
+        if reg in self.unsupported or reg in self.readonly:
             return False, FLAG_ERRORS[0x02]
         meta = REG_META.get(reg)
         if meta is None:
@@ -685,11 +708,14 @@ class MockVEDirect:
             return False, FLAG_ERRORS[0x04]
         if reg == REG_REMOTE_CONTROL:
             value |= self.regs.get(reg, 0)  # bits can only be set
-        self.regs[reg] = value
         if reg in (REG_BATTERY_VOLTAGE, REG_BATTERY_VOLTAGE_SETTING):
-            self.regs[REG_BATTERY_VOLTAGE_SETTING] = value
+            # Either id sets the voltage; 0xEDEF always reads the operating one.
+            if REG_BATTERY_VOLTAGE_SETTING not in self.unsupported:
+                self.regs[REG_BATTERY_VOLTAGE_SETTING] = value
             if value:
                 self.regs[REG_BATTERY_VOLTAGE] = value
+            return True, ""
+        self.regs[reg] = value
         if reg == REG_DEVICE_MODE:
             self.regs[REG_DEVICE_STATE] = 3 if value == DEVICE_MODE_ON else 0
             self.regs[REG_OFF_REASON] = 0 if value == DEVICE_MODE_ON else 1 << 2

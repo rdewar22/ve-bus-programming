@@ -220,7 +220,17 @@ class TestApply(unittest.TestCase):
         b.set = flaky
         steps, _ = m.build_plan(m.read_current(b))
         self.assertFalse(m.apply_steps(b, steps, out=lambda s: None))
-        self.assertEqual(written, [vd.REG_BATTERY_VOLTAGE_SETTING])
+        self.assertEqual(written, [vd.REG_BATTERY_VOLTAGE])
+
+    def test_system_voltage_written_via_edef_on_pre_117_firmware(self):
+        # fw 1.12–1.16: 0xEDEA is readable but answers 'not supported' to set.
+        b = vd.MockVEDirect()
+        b.readonly.add(vd.REG_BATTERY_VOLTAGE_SETTING)
+        steps, _ = m.build_plan(m.read_current(b))
+        self.assertEqual(steps[0].write_reg, vd.REG_BATTERY_VOLTAGE)
+        self.assertTrue(m.apply_steps(b, steps, out=lambda s: None))
+        self.assertTrue(all(r.status == "PASS"
+                            for r in m.run_checks(m.read_current(b))))
 
     def test_auto_detect_that_found_48v_still_fails(self):
         # 0xEDEF reads 48 on an auto-detecting unit; only 0xEDEA shows auto.
