@@ -51,15 +51,113 @@ class TestFrames(unittest.TestCase):
     def test_format_values(self):
         self.assertEqual(vd.format_reg_value(vd.REG_ABSORPTION_VOLTAGE, 5700),
                          "57.00V")
-        self.assertEqual(vd.format_reg_value(vd.REG_BATTERY_VOLTAGE, 0),
-                         "auto-detect")
+        self.assertEqual(
+            vd.format_reg_value(vd.REG_BATTERY_VOLTAGE_SETTING, 0),
+            "auto-detect")
         self.assertEqual(vd.format_reg_value(vd.REG_BATTERY_TYPE, 0xFF),
-                         "user defined")
+                         "User defined")
+        self.assertEqual(vd.format_reg_value(vd.REG_DEVICE_STATE, 5), "Float")
+        self.assertEqual(vd.format_reg_value(vd.REG_BATTERY_TEMP, 0xFFFF), "n/a")
+        self.assertEqual(vd.format_reg_value(vd.REG_LOAD_CONTROL, 0x81),
+                         "Auto (BatteryLife)")  # high nibble masked
+        self.assertEqual(vd.format_reg_value(vd.REG_OFF_REASON, 0b101),
+                         "no PV input, soft switch (device mode)")
+
+    def test_signed_roundtrip(self):
+        raw = vd.to_raw(vd.REG_TEMP_COMPENSATION, -64.8)
+        self.assertEqual(raw, 0x10000 - 6480)
+        self.assertAlmostEqual(vd.to_eng(vd.REG_TEMP_COMPENSATION, raw), -64.8)
+        self.assertEqual(vd.format_reg_value(vd.REG_TEMP_COMPENSATION, raw),
+                         "-64.80mV/K")
+
+
+class TestDocExamples(unittest.TestCase):
+    """Frames copied from the HEX protocol doc's 'Message examples'."""
+
+    def test_get_max_current(self):
+        self.assertEqual(vd.build_get(vd.REG_MAX_CURRENT), b":7F0ED0071\n")
+        cmd, payload = vd.parse_frame(":7F0ED009600DB")
+        self.assertEqual(vd.decode_reply(payload, vd.REG_MAX_CURRENT), (0, 150))
+
+    def test_set_max_current(self):
+        self.assertEqual(vd.build_set(vd.REG_MAX_CURRENT, 100, 2),
+                         b":8F0ED0064000C\n")
+
+    def test_ping_reply_and_version(self):
+        cmd, payload = vd.parse_frame(":51641F9")
+        self.assertEqual(cmd, vd.RSP_PING)
+        word = int.from_bytes(payload, "little")
+        self.assertEqual(word, 0x4116)
+        self.assertEqual(vd.format_version(word), "v1.16")  # not v65.16
+
+    def test_product_id_reply(self):
+        self.assertEqual(vd.build_frame(vd.CMD_PRODUCT_ID), b":451\n")
+        cmd, payload = vd.parse_frame(":1000351")
+        self.assertEqual((cmd, int.from_bytes(payload[:2], "little")),
+                         (vd.RSP_DONE, 0x0300))
+
+    def test_async_frame_parses_but_is_not_a_get(self):
+        cmd, payload = vd.parse_frame(":A0102000543")
+        self.assertEqual(cmd, vd.CMD_ASYNC)
+        self.assertEqual(vd.decode_reply(payload, vd.REG_DEVICE_STATE), (0, 5))
+
+
+def vals_of(b) -> dict:
+    return {reg: b.get(reg)[0] for reg in vd.REG_META}
+
+
+class TestValidation(unittest.TestCase):
+    def setUp(self):
+        self.b = vd.MockVEDirect()
+        self.b.regs[vd.REG_BATTERY_TYPE] = vd.BATTERY_TYPE_USER
+
+    def check(self, reg, raw):
+        return vd.validate_write(reg, raw, vals_of(self.b))
+
+    def test_voltage_needs_user_type(self):
+        self.b.regs[vd.REG_BATTERY_TYPE] = 3
+        self.assertFalse(self.check(vd.REG_ABSORPTION_VOLTAGE, 5700).ok)
+        ok, err = self.b.set(vd.REG_ABSORPTION_VOLTAGE, 5700)
+        self.assertFalse(ok)  # mock mirrors the charger: parameter error
+        self.assertIn("parameter", err)
+
+    def test_voltage_range_from_device(self):
+        self.assertTrue(self.check(vd.REG_ABSORPTION_VOLTAGE, 5700).ok)
+        self.assertFalse(self.check(vd.REG_ABSORPTION_VOLTAGE, 7000).ok)
+
+    def test_voltage_range_fallback_scales_12v_window(self):
+        self.b.unsupported |= {vd.REG_ADJ_VOLTAGE_MIN, vd.REG_ADJ_VOLTAGE_MAX}
+        self.assertEqual(vd.voltage_limits(vals_of(self.b)), (32.0, 69.6))
+
+    def test_float_not_above_absorption(self):
+        self.assertFalse(self.check(vd.REG_FLOAT_VOLTAGE, 5800).ok)
+        self.assertFalse(self.check(vd.REG_ABSORPTION_VOLTAGE, 5500).ok)
+
+    def test_temp_comp_limit_scales(self):
+        tc = vd.REG_TEMP_COMPENSATION
+        self.assertTrue(self.check(tc, vd.to_raw(tc, -64.8)).ok)
+        self.assertFalse(self.check(tc, vd.to_raw(tc, -90.0)).ok)
+
+    def test_max_current_vs_rating(self):
+        self.assertTrue(self.check(vd.REG_MAX_CURRENT, 450).ok)
+        self.assertFalse(self.check(vd.REG_MAX_CURRENT, 451).ok)
+
+    def test_read_only_and_out_of_range(self):
+        self.assertFalse(self.check(vd.REG_PANEL_POWER, 1).ok)
+        self.assertFalse(self.check(vd.REG_MAX_CURRENT, -1).ok)
+        self.assertFalse(self.check(vd.REG_BATTERY_VOLTAGE_SETTING, 20).ok)
+
+    def test_load_levels_ordered(self):
+        b = vd.MockVEDirect(load_output=True)
+        v = vals_of(b)
+        self.assertFalse(vd.validate_write(vd.REG_LOAD_HIGH_LEVEL, 4500, v).ok)
+        self.assertFalse(vd.validate_write(vd.REG_LOAD_LOW_LEVEL, 5300, v).ok)
+        self.assertTrue(vd.validate_write(vd.REG_LOAD_LOW_LEVEL, 4700, v).ok)
 
 
 def compliant_mock() -> vd.MockVEDirect:
     b = vd.MockVEDirect()
-    b.regs.update({vd.REG_BATTERY_VOLTAGE: 48,
+    b.regs.update({vd.REG_BATTERY_VOLTAGE_SETTING: 48,
                    vd.REG_BATTERY_TYPE: vd.BATTERY_TYPE_USER,
                    vd.REG_ABSORPTION_VOLTAGE: 5700,
                    vd.REG_FLOAT_VOLTAGE: 5500})
@@ -70,7 +168,7 @@ class TestPlanAndChecks(unittest.TestCase):
     def test_factory_mock_plan_order(self):
         steps, notes = m.build_plan(m.read_current(vd.MockVEDirect()))
         self.assertEqual([(s.reg, s.value) for s in steps],
-                         [(vd.REG_BATTERY_VOLTAGE, 48),
+                         [(vd.REG_BATTERY_VOLTAGE_SETTING, 48),
                           (vd.REG_BATTERY_TYPE, 0xFF),
                           (vd.REG_ABSORPTION_VOLTAGE, 5700),
                           (vd.REG_FLOAT_VOLTAGE, 5500)])
@@ -122,7 +220,16 @@ class TestApply(unittest.TestCase):
         b.set = flaky
         steps, _ = m.build_plan(m.read_current(b))
         self.assertFalse(m.apply_steps(b, steps, out=lambda s: None))
-        self.assertEqual(written, [vd.REG_BATTERY_VOLTAGE])
+        self.assertEqual(written, [vd.REG_BATTERY_VOLTAGE_SETTING])
+
+    def test_auto_detect_that_found_48v_still_fails(self):
+        # 0xEDEF reads 48 on an auto-detecting unit; only 0xEDEA shows auto.
+        b = compliant_mock()
+        b.regs[vd.REG_BATTERY_VOLTAGE_SETTING] = 0
+        b.regs[vd.REG_BATTERY_VOLTAGE] = 48
+        results = m.run_checks(m.read_current(b))
+        self.assertEqual([r.status for r in results].count("FAIL"), 1)
+        self.assertIn("auto-detect", results[0].detail)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,9 @@ battery settings on a Victron MPPT (SmartSolar/BlueSolar) over VE.Direct.
 
 Target profile — everything lives in VictronConnect's Battery section:
 
-    Battery (system) voltage   0xEDEF == 48       (never auto-detect)
+    Battery voltage setting    0xEDEA == 48       (never auto-detect; 0xEDEF
+                                                   reads the operating voltage,
+                                                   so it can't tell auto apart)
     Battery type               0xEDF1 == user     (required so the custom
                                                    voltages below stick)
     Absorption voltage         0xEDF7 == 5700     (57.00 V)
@@ -46,7 +48,7 @@ PROFILE_NAME = "RUiXU solar charger (48V LiFePO4)"
 # (register, target raw value) in write order: system voltage and battery
 # type first — voltages only stick on a user-defined battery type.
 TARGETS = [
-    (vd.REG_BATTERY_VOLTAGE, 48),
+    (vd.REG_BATTERY_VOLTAGE_SETTING, 48),
     (vd.REG_BATTERY_TYPE, vd.BATTERY_TYPE_USER),
     (vd.REG_ABSORPTION_VOLTAGE, 5700),
     (vd.REG_FLOAT_VOLTAGE, 5500),
@@ -125,7 +127,7 @@ def apply_steps(backend, steps: list[PlanStep], out=print) -> bool:
 
 def print_report(port: str, backend, results: list[CheckResult]) -> None:
     version = backend.ping()
-    ver = f", app v{version >> 8}.{version & 0xFF:02X}" if version else ""
+    ver = f", app {vd.format_version(version)}" if version else ""
     print(f"\n== {port} — {backend.description}{ver}")
     for r in results:
         print(f"  {r.status:<6} {r.name:<38} {r.detail}")

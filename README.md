@@ -26,9 +26,10 @@ https://www.victronenergy.com/upload/documents/Technical-Information-Interfacing
 | `tui/bus_scan.py` | **Read-only VE.Bus address scanner** — enumerates every unit behind one MK3 (parallel / split-phase systems), per-unit telemetry + AC/DC info frames, side-by-side report (see FINDINGS §12) |
 | `tui/verify_ruixu.py` | **Read-only profile check** — compares every setting against the RUiXU 48V LiFePO4 profile, PASS/FAIL per setting (see below) |
 | `tui/apply_ruixu.py` | **Profile writer** — diff-based, writes only deviations in VEConfigure order, readback-verified, then re-runs the verify suite (see below) |
+| `tui/mppt_tui.py` | **Solar charger (MPPT) terminal dashboard** — the `tui.py` counterpart over VE.Direct: live telemetry, battery + load-output settings, register browser, guarded writes (see below) |
 | `tui/mppt_ruixu.py` | **Solar charger (MPPT) profile tool** — verify/apply the battery-section settings over VE.Direct HEX protocol (different bus than everything above; see below) |
 | `tui/vebus/protocol.py` | Reusable backend: serial/checksum/frame protocol, `SerialBackend`, `MockBackend`, and all decoders. Importable by scripts and tests |
-| `tui/vedirect.py` | Minimal VE.Direct HEX backend for MPPT controllers: frame build/parse, get/set with readback, `MockVEDirect` |
+| `tui/vedirect.py` | VE.Direct HEX backend for MPPT controllers: frame build/parse, register map + decoders from Victron's HEX doc, write validation, `SerialVEDirect` / `MockVEDirect` |
 | `setv.py` | Set absorption and float voltage (WriteViaID example) |
 | `settings_sweep.py` | Sweep all 256 setting IDs — dump supported settings to CSV for diffing |
 | `ram_sweep.py` | Sweep all 256 RAM variable IDs — identify live telemetry values |
@@ -109,7 +110,8 @@ model, and the port (plus an `[ADDR n]` chip when watching a non-master unit).
 python3 tui/test_protocol.py    # unit tests, no hardware required
 python3 tui/test_verify.py      # verify_ruixu checks
 python3 tui/test_apply.py       # apply_ruixu plan/write/idempotency
-python3 tui/test_mppt.py        # VE.Direct frames + mppt_ruixu plan/apply
+python3 tui/test_mppt.py        # VE.Direct frames, decoders, validation, mppt_ruixu
+.venv/bin/python tui/test_mppt_tui.py   # mppt_tui end-to-end against the mock (needs textual)
 ```
 
 ## Profile Verify & Apply (`tui/verify_ruixu.py`, `tui/apply_ruixu.py`)
@@ -155,9 +157,57 @@ python3 tui/mppt_ruixu.py --apply              # interactive confirm, readback-v
 ```
 
 Auto-detects the port from `/dev/serial/by-id/*VE_Direct*`. Register ids are
-from the published BlueSolar/SmartSolar HEX register list; every write is
-readback-verified, so a model that disagrees fails loudly instead of writing
-silently wrong values.
+from Victron's [VE.Direct HEX protocol doc for BlueSolar/SmartSolar MPPTs](https://www.victronenergy.com/upload/documents/BlueSolar-HEX-protocol.pdf)
+(Rev 18); every write is readback-verified, so a model that disagrees fails
+loudly instead of writing silently wrong values. The system-voltage check reads
+`0xEDEA` (the *setting*, 0 = auto-detect), not `0xEDEF` — `0xEDEF` always
+reports the operating voltage, so an auto-detecting unit that found 48V would
+otherwise pass.
+
+## Solar Charger TUI (`tui/mppt_tui.py`)
+
+The MPPT counterpart of `tui/tui.py` — same layout and safety model, but over
+VE.Direct (VE.Direct-USB cable, not the MK3). Tabs:
+
+- **Dashboard** — live telemetry on an auto-refresh (charge state, error, off
+  reason, PV V/A/W, tracker mode, battery V, charger and battery current,
+  temperatures, yield today/yesterday/total) plus a guarded Charger ON/OFF
+  soft switch (`0x0200`; enables the remote on/off bit first on firmware
+  < 1.42).
+- **Battery** — every battery-section setting, system voltage (auto / 12 /
+  24 / 36 / 48), battery type → User defined / back to preset, individual
+  edits (absorption, float, equalisation, re-bulk offset, max current,
+  absorption time, tail current, temp compensation, low-temp cut-off), and a
+  one-button **RUiXU solar profile** (same diff-based plan as `mppt_ruixu.py`).
+- **Load output** — mode + switch levels + AES timer, on the 10/15/20A models
+  that have a load output (disabled otherwise, from the capabilities register).
+  Mode writes are read-modify-write: the reserved high nibble is preserved.
+- **Registers** — every known register raw + decoded, plus a read-only probe
+  for any register id (useful on a new model or firmware).
+
+```bash
+.venv/bin/python tui/mppt_tui.py                    # auto-detect /dev/serial/by-id/*VE_Direct*
+.venv/bin/python tui/mppt_tui.py --port /dev/ttyUSB1
+.venv/bin/python tui/mppt_tui.py --mock              # no hardware (also the fallback if no port opens)
+.venv/bin/python tui/mppt_tui.py --mock --mock-load  # simulate a model with a load output
+```
+
+Safety differences from the VE.Bus TUI:
+
+- **No RAM-only mode** — every VE.Direct write goes straight to the
+  controller's NVM. Writes are never looped; telemetry is reads only.
+- **Writes are validated before the confirm dialog, and blocked if they
+  fail** — charge voltages within the device's own adjustable range
+  (`0x2211`/`0x2212`, else the doc's 12V window scaled to the system), float ≤
+  absorption, temp compensation within the scaled ±21 mV/K, max current ≤ the
+  charger rating, and charge voltages refused unless the battery type is User
+  defined (they don't stick otherwise; an out-of-range set raises error 119,
+  which needs a factory reset + power cycle to clear).
+- **Readback-verified**, and a battery-type or system-voltage change reloads
+  everything (both move other values).
+
+Not exposed on purpose: restore factory defaults (`0x0004`), history clear,
+relay settings, and the lighting-controller timer.
 
 ## Multi-Unit Scanning (`tui/bus_scan.py`)
 
