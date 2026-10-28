@@ -26,7 +26,9 @@ https://www.victronenergy.com/upload/documents/Technical-Information-Interfacing
 | `tui/bus_scan.py` | **Read-only VE.Bus address scanner** — enumerates every unit behind one MK3 (parallel / split-phase systems), per-unit telemetry + AC/DC info frames, side-by-side report (see FINDINGS §12) |
 | `tui/verify_ruixu.py` | **Read-only profile check** — compares every setting against the RUiXU 48V LiFePO4 profile, PASS/FAIL per setting (see below) |
 | `tui/apply_ruixu.py` | **Profile writer** — diff-based, writes only deviations in VEConfigure order, readback-verified, then re-runs the verify suite (see below) |
+| `tui/mppt_ruixu.py` | **Solar charger (MPPT) profile tool** — verify/apply the battery-section settings over VE.Direct HEX protocol (different bus than everything above; see below) |
 | `tui/vebus/protocol.py` | Reusable backend: serial/checksum/frame protocol, `SerialBackend`, `MockBackend`, and all decoders. Importable by scripts and tests |
+| `tui/vedirect.py` | Minimal VE.Direct HEX backend for MPPT controllers: frame build/parse, get/set with readback, `MockVEDirect` |
 | `setv.py` | Set absorption and float voltage (WriteViaID example) |
 | `settings_sweep.py` | Sweep all 256 setting IDs — dump supported settings to CSV for diffing |
 | `ram_sweep.py` | Sweep all 256 RAM variable IDs — identify live telemetry values |
@@ -107,6 +109,7 @@ model, and the port (plus an `[ADDR n]` chip when watching a non-master unit).
 python3 tui/test_protocol.py    # unit tests, no hardware required
 python3 tui/test_verify.py      # verify_ruixu checks
 python3 tui/test_apply.py       # apply_ruixu plan/write/idempotency
+python3 tui/test_mppt.py        # VE.Direct frames + mppt_ruixu plan/apply
 ```
 
 ## Profile Verify & Apply (`tui/verify_ruixu.py`, `tui/apply_ruixu.py`)
@@ -134,6 +137,27 @@ frequency (verified live only — a 50 Hz unit can't be fixed here), the
 240V systems. Stop whatever holds the port first (`sudo systemctl stop
 grounded-inverter grounded-inverter2`), restart it after. Exit codes are
 scriptable: 0 compliant, 1 deviations/failed writes, 2 port/link problem.
+
+### Solar charge controller (`tui/mppt_ruixu.py`)
+
+The MPPT counterpart, over **VE.Direct** (the small JST port / VE.Direct-USB
+cable, 19200 8N1 — not the VE.Bus RJ45). Targets the Battery-section values:
+48V system voltage, user-defined battery type, 57.00V absorption, 55.00V
+float (deliberately above the inverter profile — solar is the primary
+charge source). The battery-type write is included because custom voltages
+don't stick while a fixed preset is selected:
+
+```bash
+python3 tui/mppt_ruixu.py --mock               # demo without hardware
+python3 tui/mppt_ruixu.py                      # verify only (read-only)
+python3 tui/mppt_ruixu.py --apply --dry-run    # show the write plan
+python3 tui/mppt_ruixu.py --apply              # interactive confirm, readback-verified
+```
+
+Auto-detects the port from `/dev/serial/by-id/*VE_Direct*`. Register ids are
+from the published BlueSolar/SmartSolar HEX register list; every write is
+readback-verified, so a model that disagrees fails loudly instead of writing
+silently wrong values.
 
 ## Multi-Unit Scanning (`tui/bus_scan.py`)
 
