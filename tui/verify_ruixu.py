@@ -6,7 +6,8 @@ verify_ruixu.py — read-only check that an inverter matches the RUiXU
 Reads each relevant setting over the MK3 and compares against the expected
 profile; nothing is ever written. Checks per unit:
 
-    AC1 input current limit        setting 6  == 300   (30.0 A)
+    AC1 input current limit        setting 6  == 300   (30.0 A; --shore-limit 16
+                                                        for a 20 A-breaker van)
     Dynamic current limiter        setting 1  bit 12 set
     Accept wide input freq range   setting 1  bit 11 set
     PowerAssist                    setting 0  bit 5 set
@@ -29,6 +30,7 @@ the sweep-and-diff method in FINDINGS §11 if needed.
     python3 tui/verify_ruixu.py                            # /dev/inverter + /dev/inverter2 if present
     python3 tui/verify_ruixu.py /dev/inverter2             # one specific port
     python3 tui/verify_ruixu.py --charger-disabled /dev/inverter2
+    python3 tui/verify_ruixu.py --shore-limit 16 /dev/inverter
 
 Exit code: 0 all required checks pass on every port, 1 any FAIL,
 2 could not open/talk to a port.
@@ -63,6 +65,8 @@ EXPECTED_VALUES = {
 }
 SETTING_IDS = [0, 1, 2, 3, 6, 9, 10, 11, 12]
 
+DEFAULT_SHORE_LIMIT_A = 30.0
+
 FREQ_TARGET = 60.0
 FREQ_TOLERANCE = 1.0
 
@@ -88,9 +92,29 @@ def _fmt(setting_id: int, raw: int) -> str:
     return p.format_setting_value(setting_id, raw)
 
 
-def run_checks(backend: p.Backend, charger_disabled: bool = False) -> list[CheckResult]:
+def shore_limit_raw(amps: float) -> int:
+    """Setting 6 raw value (deci-amps) for a shore limit in amps."""
+    return int(round(amps * 10))
+
+
+def shore_limit_arg(text: str) -> float:
+    """argparse type for --shore-limit: amps, 0.1 A steps, 1-100 A."""
+    try:
+        amps = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}")
+    if not 1.0 <= amps <= 100.0 or abs(amps * 10 - round(amps * 10)) > 1e-6:
+        raise argparse.ArgumentTypeError(
+            f"{text} A: use 1-100 A in 0.1 A steps (e.g. 30 or 16)")
+    return amps
+
+
+def run_checks(backend: p.Backend, charger_disabled: bool = False,
+               shore_limit_a: float = DEFAULT_SHORE_LIMIT_A) -> list[CheckResult]:
     """All profile checks against an open backend. Read-only."""
     results: list[CheckResult] = []
+    expected = {**EXPECTED_VALUES, 6: shore_limit_raw(shore_limit_a)}
+    limit_label = f"{shore_limit_a:g}A"
     vals: dict[int, Optional[int]] = {
         sid: backend.read_setting(sid) for sid in SETTING_IDS
     }
@@ -110,7 +134,7 @@ def run_checks(backend: p.Backend, charger_disabled: bool = False) -> list[Check
     def value_check(sid: int, name: str) -> None:
         if unreadable(sid, name):
             return
-        v, want = vals[sid], EXPECTED_VALUES[sid]
+        v, want = vals[sid], expected[sid]
         if v == want:
             results.append(CheckResult("PASS", name,
                                        f"{_fmt(sid, v)} (setting {sid} = {v})"))
@@ -129,7 +153,7 @@ def run_checks(backend: p.Backend, charger_disabled: bool = False) -> list[Check
         status = "PASS" if is_set == want_set else "FAIL"
         results.append(CheckResult(status, name, detail))
 
-    value_check(6, "AC input current limit 30A")
+    value_check(6, f"AC input current limit {limit_label}")
     results.append(CheckResult(
         "MANUAL", "Current limit overruled by remote",
         "no known setting ID — verify the checkbox in VEConfigure"
@@ -181,13 +205,13 @@ def run_checks(backend: p.Backend, charger_disabled: bool = False) -> list[Check
     # a panel/app may have moved it while setting 6 stays the stored value.
     cfg = backend.read_config()
     if cfg is None:
-        results.append(CheckResult("SKIP", "Runtime shore limit 30A ('F' 5)",
+        results.append(CheckResult("SKIP", f"Runtime shore limit {limit_label} ('F' 5)",
                                    "config frame did not respond"))
-    elif abs(cfg.actual_current - 30.0) < 0.05:
-        results.append(CheckResult("PASS", "Runtime shore limit 30A ('F' 5)",
+    elif abs(cfg.actual_current - shore_limit_a) < 0.05:
+        results.append(CheckResult("PASS", f"Runtime shore limit {limit_label} ('F' 5)",
                                    f"{cfg.actual_current:.1f} A"))
     else:
-        results.append(CheckResult("WARN", "Runtime shore limit 30A ('F' 5)",
+        results.append(CheckResult("WARN", f"Runtime shore limit {limit_label} ('F' 5)",
                                    f"live limit is {cfg.actual_current:.1f} A"
                                    " (remote override?) — stored setting 6 is"
                                    " the config check"))
@@ -242,6 +266,10 @@ def main() -> int:
     ap.add_argument("--charger-disabled", action="store_true",
                     help="this unit is the single 120V inverter of a 240V"
                          " system and should have its charger disabled")
+    ap.add_argument("--shore-limit", type=shore_limit_arg,
+                    default=DEFAULT_SHORE_LIMIT_A, metavar="AMPS",
+                    help="expected AC1 shore limit (default 30; 16 for a"
+                         " 20 A-breaker van)")
     args = ap.parse_args()
 
     if args.mock:
@@ -268,7 +296,8 @@ def main() -> int:
             exit_code = max(exit_code, 2)
             continue
         try:
-            results = run_checks(backend, charger_disabled=args.charger_disabled)
+            results = run_checks(backend, charger_disabled=args.charger_disabled,
+                                 shore_limit_a=args.shore_limit)
             if all_settings_silent(results):
                 print(f"\n== {port} — no response from the unit."
                       " Is it switched ON and is this the right port?")

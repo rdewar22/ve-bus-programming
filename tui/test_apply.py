@@ -134,5 +134,39 @@ class TestShoreLimit(unittest.TestCase):
         self.assertEqual(status, "skip")
 
 
+class TestShoreLimitOption(unittest.TestCase):
+    def args(self, **kw):
+        import argparse
+        base = dict(dry_run=False, yes=True, charger_disabled=False, shore_limit=16.0)
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_plan_on_30a_profile_unit_writes_only_setting_6(self):
+        steps, notes = a.build_plan(a.read_current(compliant_mock()), 16.0)
+        self.assertEqual([(s.setting_id, s.value) for s in steps], [(6, 160)])
+        self.assertEqual(notes, [])
+
+    def test_default_plan_unchanged(self):
+        steps, _ = a.build_plan(a.read_current(compliant_mock()))
+        self.assertEqual(steps, [])
+
+    def test_apply_16a_end_to_end(self):
+        b = compliant_mock()
+        rc = a.process_port("MOCK", b, self.args())
+        self.assertEqual(rc, 0)
+        self.assertEqual(b.read_setting(6), 160)
+        self.assertEqual(b.read_config().actual_current, 16.0)
+
+    def test_dry_run_writes_nothing_and_names_target(self):
+        import io, contextlib
+        b = compliant_mock()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = a.process_port("MOCK", b, self.args(dry_run=True))
+        self.assertEqual(rc, 0)
+        self.assertEqual(b.read_setting(6), 300)
+        self.assertIn("30.0 → 16.0 A", buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
